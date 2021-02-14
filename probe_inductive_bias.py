@@ -6,8 +6,6 @@ import torch
 import torchvision
 import tqdm
 
-import clip_utils
-import crw_utils
 
 from load_blender import load_blender_data
 
@@ -37,18 +35,39 @@ def probe(
         raise NotImplementedError
 
     # Load embedding model
-    if model_type == 'clip_rn50':
-        clip_utils.load_rn()
-        embed = lambda ims: clip_utils.clip_model_rn(images_or_text=ims)
-        assert not clip_utils.clip_model_rn.training
-    elif model_type == 'clip_vit':
-        clip_utils.load_vit()
-        embed = lambda ims: clip_utils.clip_model_vit(images_or_text=ims)
-        assert not clip_utils.clip_model_vit.training
+    if model_type.startswith('clip_'):
+        import clip_utils
+
+        normalize = clip_utils.CLIP_NORMALIZE
+        if model_type == 'clip_rn50':
+            clip_utils.load_rn()
+            embed = lambda ims: clip_utils.clip_model_rn(images_or_text=ims)
+            assert not clip_utils.clip_model_rn.training
+        elif model_type == 'clip_vit':
+            clip_utils.load_vit()
+            embed = lambda ims: clip_utils.clip_model_vit(images_or_text=ims)
+            assert not clip_utils.clip_model_vit.training
     elif model_type == 'crw_rn18':
+        import crw_utils
+
+        normalize = lambda ims: ims  # crw_utils.embed_image handles normalization
         crw_utils.load_rn18()
-        embed = lambda ims: crw_utils.embed_image(ims, spatial_reduction='mean')
+        embed = lambda ims: crw_utils.embed_image(ims, spatial_reduction='flatten')
         assert not crw_utils.crw_rn18_model.training
+    elif model_type.startswith('imagenet_'):
+        # Pretrained models in torchvision trained with ImageNet supervision
+        normalize = torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                                     std=[0.229, 0.224, 0.225])
+        if model_type == 'imagenet_resnext50_32x4d':
+            model = torchvision.models.resnext50_32x4d(pretrained=True)
+            model.eval()
+            model.to(device)
+            # TODO: possibly set model.layer4 to identity to extract layer3 features?
+            model.fc = torch.nn.Identity()  # don't project from features to classes
+            embed = model
+            assert not model.training
+        # elif model_type == 'imagenet_wide_resnet50_2':
+        #     pass
 
     # Prepare images
     images = torch.from_numpy(images).permute(0, 3, 1, 2)
@@ -61,9 +80,9 @@ def probe(
 
         embedding = []
         for i in tqdm.trange(0, len(images), batch_size, desc='Embedding images'):
-            images_batch = images[i:i+batch_size].to(device)
+            images_batch = images[i:i+batch_size].float().to(device)
             images_batch = torch.nn.functional.interpolate(images_batch, size=(224, 224), mode='bicubic')
-            images_batch = clip_utils.CLIP_NORMALIZE(images_batch)
+            images_batch = normalize(images_batch)
             print('images_batch', images_batch.shape)
             embedding_batch = embed(images_batch)
             embedding.append(embedding_batch)
