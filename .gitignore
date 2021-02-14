@@ -8,3 +8,4 @@
 data/*
 logs/*
 .vscode/
+wandb/
