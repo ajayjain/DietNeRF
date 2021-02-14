@@ -208,8 +208,7 @@ def create_nerf(args):
     skips = [4]
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
-                 checkpoint=args.checkpoint_rendering)
+                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
     model = nn.DataParallel(model).to(device)
     wandb.watch(model)
     grad_vars = list(model.parameters())
@@ -218,8 +217,7 @@ def create_nerf(args):
     if args.N_importance > 0:
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
-                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
-                          checkpoint=args.checkpoint_rendering)
+                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
         model_fine = nn.DataParallel(model_fine).to(device)
         grad_vars += list(model_fine.parameters())
 
@@ -727,8 +725,13 @@ def train():
     network_fn = render_kwargs_train['network_fn']
     network_fine = render_kwargs_train['network_fine']
     if args.checkpoint_rendering:
-        render_kwargs_train['network_fn'] = lambda x: torch.utils.checkpoint.checkpoint(network_fn, x)
-        render_kwargs_train['network_fine'] = lambda x: torch.utils.checkpoint.checkpoint(network_fine, x)
+        # Pass a dummy input tensor that requires grad so checkpointing does something
+        # https://discuss.pytorch.org/t/checkpoint-with-no-grad-requiring-inputs-problem/19117/10
+        dummy = torch.ones(1, dtype=torch.float32, requires_grad=True, device=device)
+        network_fn_wrapper = lambda x, y: network_fn(x)
+        network_fine_wrapper = lambda x, y: network_fine(x)
+        render_kwargs_train['network_fn'] = lambda x: torch.utils.checkpoint.checkpoint(network_fn_wrapper, x, dummy)
+        render_kwargs_train['network_fine'] = lambda x: torch.utils.checkpoint.checkpoint(network_fine_wrapper, x, dummy)
 
 
     bds_dict = {

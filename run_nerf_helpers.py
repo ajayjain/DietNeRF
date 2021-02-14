@@ -74,7 +74,7 @@ def get_embedder(multires, i=0):
 
 # Model
 class NeRF(nn.Module):
-    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False, checkpoint=False):
+    def __init__(self, D=8, W=256, input_ch=3, input_ch_views=3, output_ch=4, skips=[4], use_viewdirs=False):
         """ 
         """
         super(NeRF, self).__init__()
@@ -84,8 +84,6 @@ class NeRF(nn.Module):
         self.input_ch_views = input_ch_views
         self.skips = skips
         self.use_viewdirs = use_viewdirs
-        # self.checkpoint = checkpoint
-        self.checkpoint = False  # debug: trying a coarser strategy
 
         self.pts_linears = nn.ModuleList(
             [DenseLayer(input_ch, W, activation="relu")] + [DenseLayer(W, W, activation="relu") if i not in self.skips else DenseLayer(W + input_ch, W, activation="relu") for i in range(D-1)])
@@ -108,32 +106,19 @@ class NeRF(nn.Module):
         input_pts, input_views = torch.split(x, [self.input_ch, self.input_ch_views], dim=-1)
         h = input_pts
         for i, l in enumerate(self.pts_linears):
-            if self.checkpoint:
-                # TODO: use a smarter strategy than recomputing all linear layers
-                h = torch.utils.checkpoint.checkpoint(self.pts_linears[i], h)
-                h = torch.utils.checkpoint.checkpoint(F.relu, h)
-            else:
-                h = self.pts_linears[i](h)
-                h = F.relu(h)
+            h = self.pts_linears[i](h)
+            h = F.relu(h)
             if i in self.skips:
                 h = torch.cat([input_pts, h], -1)
 
         if self.use_viewdirs:
-            if self.checkpoint:
-                alpha = torch.utils.checkpoint.checkpoint(self.alpha_linear, h)
-                feature = torch.utils.checkpoint.checkpoint(self.feature_linear, h)
-            else:
-                alpha = self.alpha_linear(h)
-                feature = self.feature_linear(h)
+            alpha = self.alpha_linear(h)
+            feature = self.feature_linear(h)
             h = torch.cat([feature, input_views], -1)
         
             for i, l in enumerate(self.views_linears):
-                if self.checkpoint:
-                    h = torch.utils.checkpoint.checkpoint(self.views_linears[i], h)
-                    h = torch.utils.checkpoint.checkpoint(F.relu, h)
-                else:
-                    h = self.views_linears[i](h)
-                    h = F.relu(h)
+                h = self.views_linears[i](h)
+                h = F.relu(h)
 
             rgb = self.rgb_linear(h)
             outputs = torch.cat([rgb, alpha], -1)
