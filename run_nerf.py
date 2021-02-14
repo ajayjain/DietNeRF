@@ -1,3 +1,5 @@
+from IPython import embed
+
 import os, sys
 import numpy as np
 import imageio
@@ -9,6 +11,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
+import wandb
 
 import matplotlib.pyplot as plt
 
@@ -17,6 +20,16 @@ from run_nerf_helpers import *
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
+
+try:
+    import clip_utils
+except ImportError:
+    print('WARN: Could not import clip_utils')
+
+try:
+    import crw_utils
+except ImportError:
+    print('WARN: Could not import crw_utils')
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -51,13 +64,17 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     return outputs
 
 
-def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
+def batchify_rays(rays_flat, chunk=1024*32, keep_keys=None, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
+    # ret_rgb_only = keep_keys and len(keep_keys) == 1 and keep_keys[0] == 'rgb_map'
     all_ret = {}
     for i in range(0, rays_flat.shape[0], chunk):
         ret = render_rays(rays_flat[i:i+chunk], **kwargs)
         for k in ret:
+            if keep_keys and k not in keep_keys:
+                # Don't save this returned value to save memory
+                continue
             if k not in all_ret:
                 all_ret[k] = []
             all_ret[k].append(ret[k])
@@ -69,6 +86,7 @@ def batchify_rays(rays_flat, chunk=1024*32, **kwargs):
 def render(H, W, focal, chunk=1024*32, rays=None, c2w=None, ndc=True,
                   near=0., far=1.,
                   use_viewdirs=False, c2w_staticcam=None,
+                  keep_keys=None,
                   **kwargs):
     """Render rays
     Args:
@@ -123,12 +141,14 @@ def render(H, W, focal, chunk=1024*32, rays=None, c2w=None, ndc=True,
         rays = torch.cat([rays, viewdirs], -1)
 
     # Render and reshape
-    all_ret = batchify_rays(rays, chunk, **kwargs)
+    all_ret = batchify_rays(rays, chunk, keep_keys=keep_keys, **kwargs)
     for k in all_ret:
         k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
         all_ret[k] = torch.reshape(all_ret[k], k_sh)
 
     k_extract = ['rgb_map', 'disp_map', 'acc_map']
+    if keep_keys:
+        k_extract = [k for k in k_extract if k in keep_keys]
     ret_list = [all_ret[k] for k in k_extract]
     ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
     return ret_list + [ret_dict]
@@ -188,15 +208,18 @@ def create_nerf(args):
     skips = [4]
     model = NeRF(D=args.netdepth, W=args.netwidth,
                  input_ch=input_ch, output_ch=output_ch, skips=skips,
-                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+                 input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
+                 checkpoint=args.checkpoint_rendering)
     model = nn.DataParallel(model).to(device)
+    wandb.watch(model)
     grad_vars = list(model.parameters())
 
     model_fine = None
     if args.N_importance > 0:
         model_fine = NeRF(D=args.netdepth_fine, W=args.netwidth_fine,
                           input_ch=input_ch, output_ch=output_ch, skips=skips,
-                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs)
+                          input_ch_views=input_ch_views, use_viewdirs=args.use_viewdirs,
+                          checkpoint=args.checkpoint_rendering)
         model_fine = nn.DataParallel(model_fine).to(device)
         grad_vars += list(model_fine.parameters())
 
@@ -235,6 +258,7 @@ def create_nerf(args):
             model_fine.load_state_dict(ckpt['network_fine_state_dict'])
 
     ##########################
+
 
     render_kwargs_train = {
         'network_query_fn' : network_query_fn,
@@ -388,7 +412,6 @@ def render_rays(ray_batch,
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
-
         rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
@@ -404,7 +427,9 @@ def render_rays(ray_batch,
 
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
-    ret = {'rgb_map' : rgb_map, 'disp_map' : disp_map, 'acc_map' : acc_map}
+    ret = {'rgb_map' : rgb_map}
+    ret['disp_map'] = disp_map
+    ret['acc_map'] = acc_map
     if retraw:
         ret['raw'] = raw
     if N_importance > 0:
@@ -418,6 +443,29 @@ def render_rays(ray_batch,
             print(f"! [Numerical Error] {k} contains nan or inf.")
 
     return ret
+
+
+def sample_rays(H, W, rays_o, rays_d, N_rand, i, start, precrop_iters, precrop_frac):
+    if i < precrop_iters:
+        dH = int(H//2 * precrop_frac)
+        dW = int(W//2 * precrop_frac)
+        coords = torch.stack(
+            torch.meshgrid(
+                torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH), 
+                torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
+            ), -1)
+        if i == start:
+            print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {precrop_iters}")                
+    else:
+        coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
+
+    coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
+    select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
+    select_coords = coords[select_inds].long()  # (N_rand, 2)
+    rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+    rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+    batch_rays = torch.stack([rays_o, rays_d], 0)  # (2, N_rand, 3)
+    return batch_rays, select_coords
 
 
 def config_parser():
@@ -519,8 +567,12 @@ def config_parser():
                         help='will take every 1/N images as LLFF test set, paper uses 8')
 
     # logging/saving options
+    parser.add_argument("--i_log",   type=int, default=1, 
+                        help='frequency of metric logging')
+    parser.add_argument("--i_log_ctr_img",   type=int, default=100, 
+                        help='frequency of train rendering logging')
     parser.add_argument("--i_print",   type=int, default=100, 
-                        help='frequency of console printout and metric loggin')
+                        help='frequency of console printout')
     parser.add_argument("--i_img",     type=int, default=500, 
                         help='frequency of tensorboard image logging')
     parser.add_argument("--i_weights", type=int, default=10000, 
@@ -530,19 +582,39 @@ def config_parser():
     parser.add_argument("--i_video",   type=int, default=50000, 
                         help='frequency of render_poses video saving')
 
+    ## options for learning with few views
+    parser.add_argument("--max_train_views", type=int, default=-1,
+                        help='limit number of training views for the mse loss')
+    parser.add_argument("--consistency_loss", type=str, default='none', choices=['none', 'consistent_with_target_rep'])
+    parser.add_argument("--consistency_loss_lam", type=float, default=0.25)
+    parser.add_argument("--consistency_nH", type=int, default=32, 
+                        help='number of rows to render for consistency loss. smaller values use less memory')
+    parser.add_argument("--consistency_nW", type=int, default=32, 
+                        help='number of columns to render for consistency loss')
+    parser.add_argument("--consistency_jitter_rays", action='store_true')
+    parser.add_argument("--consistency_model_type", type=str, choices=['clip_vit', 'clip_rn50', 'crw_rn18'])
+    parser.add_argument("--consistency_crw_spatial_reduction", type=str, choices=['mean', 'flatten'])
+    parser.add_argument("--consistency_crw_multiscale", action='store_true')
+    parser.add_argument("--checkpoint_rendering", action='store_true')
+
     return parser
 
 
 def train():
+    wandb.init(project="nerf-nl", entity="ajayj")
 
     parser = config_parser()
     args = parser.parse_args()
+    wandb.run.name = args.expname
+    wandb.run.save()
+    wandb.config.update(args)
 
     # Multi-GPU
     args.n_gpus = torch.cuda.device_count()
     print(f"Using {args.n_gpus} GPU(s).")
 
     # Load data
+    print('dataset_type:', args.dataset_type)
     if args.dataset_type == 'llff':
         images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
                                                                   recenter=True, bd_factor=.75,
@@ -601,8 +673,35 @@ def train():
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
 
+    # Subsample training indices to simulate having fewer training views
+    i_train_poses = i_train  # Use all training poses for auxiliary representation consistency loss.
+                             # TODO: Could also use any continuous set of poses including the
+                             # val and test poses, since we don't use the images for aux loss.
+    if args.max_train_views > 0:
+        print('Original training views:', i_train)
+        i_train = np.random.choice(i_train, size=args.max_train_views, replace=False)
+        print('Subsampled train views:', i_train)
+
+    # Load embedding network for consistency loss
+    if args.consistency_loss != 'none':
+        print(f'Using auxilliary consistency loss [{args.consistency_loss}], weight [{args.consistency_loss_lam}]')
+        # Load embedding model
+        if args.consistency_model_type == 'clip_rn50':
+            clip_utils.load_rn()
+            embed = lambda ims: clip_utils.clip_model_rn(images_or_text=ims)
+            assert not clip_utils.clip_model_rn.training
+        elif args.consistency_model_type == 'clip_vit':
+            clip_utils.load_vit()
+            embed = lambda ims: clip_utils.clip_model_vit(images_or_text=ims)
+            assert not clip_utils.clip_model_vit.training
+        elif args.consistency_model_type == 'crw_rn18':
+            crw_utils.load_rn18()
+            embed = lambda ims: crw_utils.embed_image(ims, spatial_reduction=args.consistency_crw_spatial_reduction)
+            assert not crw_utils.crw_rn18_model.training
+
     # Cast intrinsics to right types
     H, W, focal = hwf
+    print('hwf', hwf)
     H, W = int(H), int(W)
     hwf = [H, W, focal]
 
@@ -626,6 +725,12 @@ def train():
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
     global_step = start
+    network_fn = render_kwargs_train['network_fn']
+    network_fine = render_kwargs_train['network_fine']
+    if args.checkpoint_rendering:
+        render_kwargs_train['network_fn'] = lambda x: torch.utils.checkpoint.checkpoint(network_fn, x)
+        render_kwargs_train['network_fine'] = lambda x: torch.utils.checkpoint.checkpoint(network_fine, x)
+
 
     bds_dict = {
         'near' : near,
@@ -690,15 +795,15 @@ def train():
     print('TEST views are', i_test)
     print('VAL views are', i_val)
 
-    # Summary writers
-    # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
-    
     start = start + 1
     for i in trange(start, N_iters):
         time0 = time.time()
+        metrics = {}
 
         # Sample random ray batch
         if use_batching:
+            assert args.consistency_loss == 'none'
+
             # Random over all images
             batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
             batch = torch.transpose(batch, 0, 1)
@@ -712,34 +817,77 @@ def train():
                 i_batch = 0
 
         else:
-            # Random from one image
+            assert N_rand is not None
+
+            # Random rays from one image
             img_i = np.random.choice(i_train)
             target = images[img_i]
             pose = poses[img_i, :3,:4]
 
-            if N_rand is not None:
-                rays_o, rays_d = get_rays(H, W, focal, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
+            rays_o, rays_d = get_rays(H, W, focal, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
+            batch_rays, select_coords = sample_rays(H, W, rays_o, rays_d, N_rand=N_rand,
+                i=i, start=start, precrop_iters=args.precrop_iters, precrop_frac=args.precrop_frac)
+            target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
-                if i < args.precrop_iters:
-                    dH = int(H//2 * args.precrop_frac)
-                    dW = int(W//2 * args.precrop_frac)
-                    coords = torch.stack(
-                        torch.meshgrid(
-                            torch.linspace(H//2 - dH, H//2 + dH - 1, 2*dH), 
-                            torch.linspace(W//2 - dW, W//2 + dW - 1, 2*dW)
-                        ), -1)
-                    if i == start:
-                        print(f"[Config] Center cropping of size {2*dH} x {2*dW} is enabled until iter {args.precrop_iters}")                
-                else:
-                    coords = torch.stack(torch.meshgrid(torch.linspace(0, H-1, H), torch.linspace(0, W-1, W)), -1)  # (H, W, 2)
+            # Representational consistency loss with rendered image
+            if args.consistency_loss == 'consistent_with_target_rep':
+                # Render from a random viewpoint
+                poses_i = np.random.choice(i_train_poses)
+                pose = poses[poses_i, :3,:4]
+                with torch.no_grad():
+                    # TODO: something strange with pts_W in get_rays when 224 nH
+                    rays = get_rays(H, W, focal, c2w=pose, nH=args.consistency_nH, nW=args.consistency_nW,
+                                    jitter=args.consistency_jitter_rays)
+                rgb = render(H, W, focal, chunk=args.chunk, rays=rays, keep_keys=['rgb_map'], **render_kwargs_train)[0]
+                rgb = rgb.permute(2, 0, 1).unsqueeze(0)
+                rgb = torch.clamp(rgb, 0, 1)
+                with torch.cuda.amp.autocast():
+                    # rgb, _ = render(H, W, focal, chunk=args.chunk, rays=rays, keep_keys=['rgb_map'], **render_kwargs_train)
+                    # rgb = rgb.permute(2, 0, 1).unsqueeze(0)
+                    # rgb = torch.clamp(rgb, 0, 1)
 
-                coords = torch.reshape(coords, [-1,2])  # (H * W, 2)
-                select_inds = np.random.choice(coords.shape[0], size=[N_rand], replace=False)  # (N_rand,)
-                select_coords = coords[select_inds].long()  # (N_rand, 2)
-                rays_o = rays_o[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                rays_d = rays_d[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
-                batch_rays = torch.stack([rays_o, rays_d], 0)  # (2, N_rand, 3)
-                target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                    if i == 0:
+                        print('consistency loss rendered rgb image shape:', rgb.shape)
+
+                    target = target.permute(2, 0, 1).unsqueeze(0)
+                    if args.consistency_model_type.startswith('clip_'):
+                        # Resize for CLIP network. TODO: Should use clip_utils.embed_image which handles normalization
+                        if args.consistency_nH == 224 and args.consistency_nW == 224:
+                            rgb = rgb[..., :224, :224]  # found that the rgb.shape[2] can be 225
+                            assert rgb.shape[2] == 224 and rgb.shape[3] == 224
+                        else:
+                            rgb = torch.nn.functional.interpolate(rgb, size=(224, 224), mode='bicubic')
+                        target = torch.nn.functional.interpolate(target, size=(224, 224), mode='bicubic')
+                        stacked = torch.cat([rgb, target], dim=0)
+                        stacked = clip_utils.CLIP_NORMALIZE(stacked)
+                        rendered_embedding, target_embedding = embed(stacked)
+                    else:
+                        # embedding at target scale
+                        if rgb.shape[2:4] != target.shape[2:4]:
+                            rgb_to_target = torch.nn.functional.interpolate(rgb, size=target.shape[2:4], mode='bicubic')
+                        else:
+                            rgb_to_target = rgb
+                        stacked = torch.cat([rgb_to_target, target], dim=0)
+                        emb_target_scale = embed(stacked)
+
+                        if args.consistency_crw_multiscale:
+                            # embedding at rendered scale
+                            target_to_rgb = torch.nn.functional.interpolate(target, size=rgb.shape[2:4], mode='bicubic')
+                            stacked = torch.cat([rgb, target_to_rgb], dim=0)
+                            emb_rgb_scale = embed(stacked)
+
+                            assert emb_target_scale.ndim == 2
+                            emb = torch.cat([emb_target_scale, emb_rgb_scale], dim=1)
+                            rendered_embedding, target_embedding = emb
+                        else:
+                            rendered_embedding, target_embedding = emb_target_scale
+
+
+
+                if i%args.i_log_ctr_img==0:
+                    metrics['train_ctr/target'] = wandb.Image(target.detach().cpu())
+                    metrics['train_ctr/rgb'] = wandb.Image(rgb.detach().cpu())
+
 
         #####  Core optimization loop  #####
         rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, rays=batch_rays,
@@ -753,9 +901,15 @@ def train():
         psnr = mse2psnr(img_loss)
 
         if 'rgb0' in extras:
+            if i == start:
+                print('Using auxilliary rgb0 mse loss')
             img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
+
+        if args.consistency_loss == 'consistent_with_target_rep':
+            consistency_loss = -torch.cosine_similarity(target_embedding, rendered_embedding, dim=-1).mean()
+            loss = loss + consistency_loss * args.consistency_loss_lam
 
         loss.backward()
         optimizer.step()
@@ -778,8 +932,8 @@ def train():
             path = os.path.join(basedir, expname, '{:06d}.tar'.format(i))
             torch.save({
                 'global_step': global_step,
-                'network_fn_state_dict': render_kwargs_train['network_fn'].state_dict(),
-                'network_fine_state_dict': render_kwargs_train['network_fine'].state_dict(),
+                'network_fn_state_dict': network_fn.state_dict(),
+                'network_fine_state_dict': network_fine.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
             }, path)
             print('Saved checkpoints at', path)
@@ -792,6 +946,8 @@ def train():
             moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
             imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
             imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
+            metrics["render_path/rgb_video"] = wandb.Video(moviebase + 'rgb.mp4')
+            metrics["render_path/disp_video"] = wandb.Video(moviebase + 'disp.mp4')
 
             # if args.use_viewdirs:
             #     render_kwargs_test['c2w_staticcam'] = render_poses[0][:3,:4]
@@ -808,51 +964,47 @@ def train():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
 
-
-    
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
-        """
-            print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
-            print('iter time {:.05f}'.format(dt))
 
-            with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_print):
-                tf.contrib.summary.scalar('loss', loss)
-                tf.contrib.summary.scalar('psnr', psnr)
-                tf.contrib.summary.histogram('tran', trans)
-                if args.N_importance > 0:
-                    tf.contrib.summary.scalar('psnr0', psnr0)
+        # Log scalars, images and histograms to wandb
+        if i%args.i_log==0:
+            metrics.update({
+                "train/loss": loss.item(),
+                "train/psnr": psnr.item(),
+                "train/tran": wandb.Histogram(trans.detach().cpu().numpy()),
+            })
+            if args.N_importance > 0:
+                metrics["train/psnr0"] = psnr0.item()
+            if args.consistency_loss != 'none':
+                metrics["train_ctr/consistency_loss"] = consistency_loss.item()
 
+        if i%args.i_img==0:
+            # Log a rendered validation view to Tensorboard
+            img_i=np.random.choice(i_val)
+            target = images[img_i]
+            pose = poses[img_i, :3,:4]
+            with torch.no_grad():
+                rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
+                                                    **render_kwargs_test)
 
-            if i%args.i_img==0:
+            psnr = mse2psnr(img2mse(rgb, target))
 
-                # Log a rendered validation view to Tensorboard
-                img_i=np.random.choice(i_val)
-                target = images[img_i]
-                pose = poses[img_i, :3,:4]
-                with torch.no_grad():
-                    rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
-                                                        **render_kwargs_test)
+            metrics = {
+                'val/rgb': wandb.Image(to8b(rgb.cpu().numpy())[np.newaxis]),
+                'val/disp': wandb.Image(disp.cpu().numpy()[np.newaxis,...,np.newaxis]),
+                'val/acc': wandb.Image(acc.cpu().numpy()[np.newaxis,...,np.newaxis]),
+                'val/psnr_holdout': psnr.item(),
+                'val/rgb_holdout': wandb.Image(target.cpu().numpy()[np.newaxis])
+            }
+            if args.N_importance > 0:
+                metrics['rgb0'] = wandb.Image(to8b(extras['rgb0'].cpu().numpy())[np.newaxis])
+                metrics['disp0'] = wandb.Image(extras['disp0'].cpu().numpy()[np.newaxis,...,np.newaxis])
+                metrics['z_std'] = wandb.Image(extras['z_std'].cpu().numpy()[np.newaxis,...,np.newaxis])
 
-                psnr = mse2psnr(img2mse(rgb, target))
+        if metrics:
+            wandb.log(metrics, step=i)
 
-                with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-
-                    tf.contrib.summary.image('rgb', to8b(rgb)[tf.newaxis])
-                    tf.contrib.summary.image('disp', disp[tf.newaxis,...,tf.newaxis])
-                    tf.contrib.summary.image('acc', acc[tf.newaxis,...,tf.newaxis])
-
-                    tf.contrib.summary.scalar('psnr_holdout', psnr)
-                    tf.contrib.summary.image('rgb_holdout', target[tf.newaxis])
-
-
-                if args.N_importance > 0:
-
-                    with tf.contrib.summary.record_summaries_every_n_global_steps(args.i_img):
-                        tf.contrib.summary.image('rgb0', to8b(extras['rgb0'])[tf.newaxis])
-                        tf.contrib.summary.image('disp0', extras['disp0'][tf.newaxis,...,tf.newaxis])
-                        tf.contrib.summary.image('z_std', extras['z_std'][tf.newaxis,...,tf.newaxis])
-        """
 
         global_step += 1
 
