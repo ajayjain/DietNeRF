@@ -317,7 +317,6 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
             noise = torch.Tensor(noise)
 
     alpha = raw2alpha(raw[...,3] + noise, dists)  # [N_rays, N_samples]
-    # weights = alpha * tf.math.cumprod(1.-alpha + 1e-10, -1, exclusive=True)
     weights = alpha * torch.cumprod(torch.cat([torch.ones((alpha.shape[0], 1)), 1.-alpha + 1e-10], -1), -1)[:, :-1]
     rgb_map = torch.sum(weights[...,None] * rgb, -2)  # [N_rays, 3]
 
@@ -842,10 +841,6 @@ def train():
                 rgb = rgb.permute(2, 0, 1).unsqueeze(0)
                 rgb = torch.clamp(rgb, 0, 1)
                 with torch.cuda.amp.autocast():
-                    # rgb, _ = render(H, W, focal, chunk=args.chunk, rays=rays, keep_keys=['rgb_map'], **render_kwargs_train)
-                    # rgb = rgb.permute(2, 0, 1).unsqueeze(0)
-                    # rgb = torch.clamp(rgb, 0, 1)
-
                     if i == 0:
                         print('consistency loss rendered rgb image shape:', rgb.shape)
 
@@ -948,13 +943,6 @@ def train():
             imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
             metrics["render_path/rgb_video"] = wandb.Video(moviebase + 'rgb.mp4')
             metrics["render_path/disp_video"] = wandb.Video(moviebase + 'disp.mp4')
-
-            # if args.use_viewdirs:
-            #     render_kwargs_test['c2w_staticcam'] = render_poses[0][:3,:4]
-            #     with torch.no_grad():
-            #         rgbs_still, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test)
-            #     render_kwargs_test['c2w_staticcam'] = None
-            #     imageio.mimwrite(moviebase + 'rgb_still.mp4', to8b(rgbs_still), fps=30, quality=8)
 
         if i%args.i_testset==0 and i > 0:
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
