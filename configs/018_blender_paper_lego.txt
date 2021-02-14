@@ -1,0 +1,34 @@
+expname = 018_blender_paper_lego_ctr_contjitter_crw
+basedir = ./logs
+datadir = ./data/nerf_synthetic/lego
+dataset_type = blender
+
+no_batching = True
+
+use_viewdirs = True
+white_bkgd = True
+lrate_decay = 500
+
+N_samples = 64
+N_importance = 128
+N_rand = 1024
+chunk = 32768
+
+precrop_iters = 500
+precrop_frac = 0.5
+
+half_res = True
+
+max_train_views = 8
+consistency_loss = consistent_with_target_rep
+consistency_loss_lam = 0.2
+consistency_nH = 300
+consistency_nW = 300
+consistency_jitter_rays = True
+consistency_model_type = crw_rn18
+consistency_crw_spatial_reduction = flatten
+consistency_crw_multiscale = False
+checkpoint_rendering = True
+
+i_log_ctr_img = 20
+i_video = 12500
