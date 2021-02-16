@@ -14,7 +14,7 @@ from run_nerf_helpers import *
 
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
-from load_blender import load_blender_data
+from load_blender import load_blender_data, pose_spherical_uniform
 
 try:
     import clip_utils
@@ -592,6 +592,12 @@ def config_parser():
     parser.add_argument("--consistency_model_type", type=str, choices=['clip_vit', 'clip_rn50'])
     parser.add_argument("--checkpoint_rendering", action='store_true')
 
+    parser.add_argument("--consistency_poses", type=str, choices=['loaded', 'uniform'], default='loaded')
+    # Options for --consistency_poses=uniform
+    parser.add_argument("--consistency_theta_range", type=float, nargs=2)
+    parser.add_argument("--consistency_phi_range", type=float, nargs=2)
+    parser.add_argument("--consistency_radius_range", type=float, nargs=2)
+
     return parser
 
 
@@ -856,10 +862,16 @@ def train():
             # Representational consistency loss with rendered image
             calc_ctr_loss = args.consistency_loss.startswith('consistent_with_target_rep') and (i % args.consistency_loss_interval == 0)
             if calc_ctr_loss:
-                # Render from a random viewpoint
-                poses_i = np.random.choice(i_train_poses)
-                pose = poses[poses_i, :3,:4]
                 with torch.no_grad():
+                    # Render from a random viewpoint
+                    if args.consistency_poses == 'loaded':
+                        poses_i = np.random.choice(i_train_poses)
+                        pose = poses[poses_i, :3,:4]
+                    elif args.consistency_poses == 'uniform':
+                        assert args.dataset_type == 'blender'
+                        pose = pose_spherical_uniform(args.consistency_theta_range, args.consistency_phi_range, args.consistency_radius_range)
+                        pose = pose[:3, :4]
+
                     # TODO: something strange with pts_W in get_rays when 224 nH
                     rays = get_rays(H, W, focal, c2w=pose, nH=args.consistency_nH, nW=args.consistency_nW,
                                     jitter=args.consistency_jitter_rays)

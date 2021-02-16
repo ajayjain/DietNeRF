@@ -34,6 +34,14 @@ def pose_spherical(theta, phi, radius):
     return c2w
 
 
+def pose_spherical_uniform(theta_range, phi_range, radius_range):
+    theta = np.random.uniform(*theta_range)
+    phi = np.random.uniform(*phi_range)
+    radius = np.random.uniform(*radius_range)
+    pose = pose_spherical(theta, phi, radius)
+    return pose
+
+
 def load_blender_data(basedir, half_res=False, testskip=1):
     splits = ['train', 'val', 'test']
     metas = {}
