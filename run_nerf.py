@@ -584,6 +584,7 @@ def config_parser():
                         help='limit number of training views for the mse loss')
     parser.add_argument("--consistency_loss", type=str, default='none', choices=['none', 'consistent_with_target_rep'])
     parser.add_argument("--consistency_loss_lam", type=float, default=0.25)
+    parser.add_argument("--consistency_loss_interval", type=float, default=1)
     parser.add_argument("--consistency_nH", type=int, default=32, 
                         help='number of rows to render for consistency loss. smaller values use less memory')
     parser.add_argument("--consistency_nW", type=int, default=32, 
@@ -832,7 +833,8 @@ def train():
             target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
             # Representational consistency loss with rendered image
-            if args.consistency_loss == 'consistent_with_target_rep':
+            calc_ctr_loss = args.consistency_loss == 'consistent_with_target_rep' and (i % args.consistency_loss_interval == 0)
+            if calc_ctr_loss:
                 # Render from a random viewpoint
                 poses_i = np.random.choice(i_train_poses)
                 pose = poses[poses_i, :3,:4]
@@ -905,7 +907,7 @@ def train():
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 
-        if args.consistency_loss == 'consistent_with_target_rep':
+        if calc_ctr_loss:
             consistency_loss = -torch.cosine_similarity(target_embedding, rendered_embedding, dim=-1).mean()
             loss = loss + consistency_loss * args.consistency_loss_lam
 
@@ -967,7 +969,7 @@ def train():
             })
             if args.N_importance > 0:
                 metrics["train/psnr0"] = psnr0.item()
-            if args.consistency_loss != 'none':
+            if calc_ctr_loss:
                 metrics["train_ctr/consistency_loss"] = consistency_loss.item()
 
         if i%args.i_img==0:
