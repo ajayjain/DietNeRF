@@ -926,17 +926,22 @@ def train():
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
 
+        consistency_loss = None
         if calc_ctr_loss:
             if args.reembed_target:
-                consistency_loss = -torch.cosine_similarity(target_embedding, rendered_embedding, dim=-1).mean()
-                consistency_loss0 = -torch.cosine_similarity(target_embedding, rendered_embedding0, dim=-1).mean()
+                consistency_loss = -torch.cosine_similarity(
+                    target_embedding, rendered_embedding, dim=-1).mean()
+                consistency_loss0 = -torch.cosine_similarity(
+                    target_embedding, rendered_embedding0, dim=-1).mean()
             else:
                 if args.consistency_loss == 'consistent_with_target_rep':
-                    target_i = np.random.randint(len(target_embeddings))
+                    # NOTE: Randomly sampling a target (run 031) is worse than sampling the same target as MSE (run 032)
+                    # target_i = np.random.randint(len(target_embeddings))
+                    target_i = np.where(i_train == img_i)[0][0]  # same target as used for the MSE loss
                     consistency_loss = -torch.cosine_similarity(
-                        target_embeddings[target_i], rendered_embedding.squeeze(0), dim=-1)
+                        target_embeddings[target_i], rendered_embedding, dim=-1)
                     consistency_loss0 = -torch.cosine_similarity(
-                        target_embeddings[target_i], rendered_embedding0.squeeze(0), dim=-1)
+                        target_embeddings[target_i], rendered_embedding0, dim=-1)
                 elif args.consistency_loss.startswith('consistent_with_target_reps'):
                     raise NotImplementedError  # DEBUG: temporary, need to add consistency_loss0
 
@@ -946,8 +951,8 @@ def train():
                         consistency_loss = consistency_loss.mean()
                     elif args.consistency_loss.endswith('_min'):
                         consistency_loss = consistency_loss.min()
-                loss = (loss + consistency_loss * args.consistency_loss_lam +
-                        consistency_loss0 * args.consistency_loss_lam0)
+            loss = (loss + consistency_loss * args.consistency_loss_lam +
+                    consistency_loss0 * args.consistency_loss_lam0)
 
         loss.backward()
         optimizer.step()
