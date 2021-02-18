@@ -578,6 +578,8 @@ def config_parser():
                         help='frequency of testset saving')
     parser.add_argument("--i_video",   type=int, default=50000, 
                         help='frequency of render_poses video saving')
+    parser.add_argument("--save_splits", action="store_true",
+                        help='save ground truth images and poses in each split')
 
     ## options for learning with few views
     parser.add_argument("--max_train_views", type=int, default=-1,
@@ -744,6 +746,22 @@ def train():
 
     # Move testing data to GPU
     render_poses = torch.Tensor(render_poses).to(device)
+
+    # Save ground truth splits for visualization
+    if args.save_splits:
+        for idx, name in [(i_train, 'train'), (i_val, 'val'), (i_test, 'test')]:
+            savedir = os.path.join(basedir, expname, '{}set'.format(name))
+            os.makedirs(savedir, exist_ok=True)
+
+            torch.save(poses[idx], os.path.join(savedir, 'poses.pth'))
+            torch.save(idx, os.path.join(savedir, 'indices.pth'))
+            for i in idx:
+                rgb8 = to8b(images[i])
+                filename = os.path.join(savedir, '{:03d}.png'.format(i))
+                imageio.imwrite(filename, rgb8)
+
+            print(name, 'poses shape', poses[idx].shape, 'images shape', images[idx].shape)
+            print(f'Saved ground truth {name} set')
 
     # Short circuit if only rendering out from trained model
     if args.render_only:
