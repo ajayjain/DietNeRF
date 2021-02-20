@@ -598,6 +598,9 @@ def config_parser():
     parser.add_argument("--consistency_phi_range", type=float, nargs=2)
     parser.add_argument("--consistency_radius_range", type=float, nargs=2)
 
+    parser.add_argument("--consistency_reembed_target", action='store_true',
+                        help='reembed target image each iteration that the consistency loss is computed')
+
     return parser
 
 
@@ -817,7 +820,6 @@ def train():
     if args.consistency_loss != 'none':
         with torch.no_grad():
             assert args.consistency_model_type.startswith('clip_')
-            assert not args.consistency_crw_multiscale
             targets = images[i_train]
             targets = targets.permute(0, 3, 1, 2)
             if args.consistency_target_augmentation != 'none':
@@ -894,7 +896,7 @@ def train():
                         else:
                             rgbs = torch.nn.functional.interpolate(rgbs, size=(224, 224), mode='bicubic')
 
-                        if args.reembed_target:
+                        if args.consistency_reembed_target:
                             target = torch.nn.functional.interpolate(target, size=(224, 224), mode='bicubic')
                             stacked = torch.cat([rgbs, target], dim=0)
                             stacked = clip_utils.CLIP_NORMALIZE(stacked)
@@ -928,7 +930,7 @@ def train():
 
         consistency_loss = None
         if calc_ctr_loss:
-            if args.reembed_target:
+            if args.consistency_reembed_target:
                 consistency_loss = -torch.cosine_similarity(
                     target_embedding, rendered_embedding, dim=-1).mean()
                 consistency_loss0 = -torch.cosine_similarity(
@@ -964,10 +966,6 @@ def train():
         new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
         for param_group in optimizer.param_groups:
             param_group['lr'] = new_lrate
-        ################################
-
-        dt = time.time()-time0
-        # print(f"Step: {global_step}, Loss: {loss}, Time: {dt}")
         #####           end            #####
 
         # Rest is logging
