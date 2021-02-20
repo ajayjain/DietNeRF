@@ -1,4 +1,4 @@
-from IPython import embed
+import IPython
 
 import os, sys
 import numpy as np
@@ -593,8 +593,8 @@ def config_parser():
                         help='number of columns to render for consistency loss')
     parser.add_argument("--consistency_jitter_rays", action='store_true')
     parser.add_argument("--consistency_model_type", type=str, choices=['clip_vit', 'clip_rn50', 'crw_rn18'])
-    parser.add_argument("--consistency_crw_spatial_reduction", type=str, choices=['mean', 'flatten'])
-    parser.add_argument("--consistency_crw_multiscale", action='store_true')
+    # parser.add_argument("--consistency_crw_spatial_reduction", type=str, choices=['mean', 'flatten'])
+    # parser.add_argument("--consistency_crw_multiscale", action='store_true')
     parser.add_argument("--checkpoint_rendering", action='store_true')
 
     return parser
@@ -694,10 +694,10 @@ def train():
             clip_utils.load_vit()
             embed = lambda ims: clip_utils.clip_model_vit(images_or_text=ims)
             assert not clip_utils.clip_model_vit.training
-        elif args.consistency_model_type == 'crw_rn18':
-            crw_utils.load_rn18()
-            embed = lambda ims: crw_utils.embed_image(ims, spatial_reduction=args.consistency_crw_spatial_reduction)
-            assert not crw_utils.crw_rn18_model.training
+        # elif args.consistency_model_type == 'crw_rn18':
+        #     crw_utils.load_rn18()
+        #     embed = lambda ims: crw_utils.embed_image(ims, spatial_reduction=args.consistency_crw_spatial_reduction)
+        #     assert not crw_utils.crw_rn18_model.training
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -860,51 +860,62 @@ def train():
                     # TODO: something strange with pts_W in get_rays when 224 nH
                     rays = get_rays(H, W, focal, c2w=pose, nH=args.consistency_nH, nW=args.consistency_nW,
                                     jitter=args.consistency_jitter_rays)
-                rgb = render(H, W, focal, chunk=args.chunk, rays=rays, keep_keys=['rgb_map'], **render_kwargs_train)[0]
-                rgb = rgb.permute(2, 0, 1).unsqueeze(0)
-                rgb = torch.clamp(rgb, 0, 1)
+
+                # rgb0 is the rendering from the coarse network, while rgb uses the fine network
+                rgb, extras = render(H, W, focal, chunk=args.chunk, rays=rays, keep_keys=['rgb_map', 'rgb0'], **render_kwargs_train)
+                if i < start + 5:
+                    # DEBUG
+                    print(i, 'rgb shape', rgb.shape, 'rgb0 shape', extras['rgb0'].shape)
+                rgbs = torch.stack([rgb, extras['rgb0']], dim=0)
+                rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
+
                 with torch.cuda.amp.autocast():
                     if i == 0:
-                        print('consistency loss rendered rgb image shape:', rgb.shape)
+                        print('consistency loss rendered rgb image shape:', rgbs.shape)
 
                     target = target.permute(2, 0, 1).unsqueeze(0)
                     if args.consistency_model_type.startswith('clip_'):
                         # Resize for CLIP network. TODO: Should use clip_utils.embed_image which handles normalization
                         if args.consistency_nH == 224 and args.consistency_nW == 224:
-                            rgb = rgb[..., :224, :224]  # found that the rgb.shape[2] can be 225
-                            assert rgb.shape[2] == 224 and rgb.shape[3] == 224
+                            rgbs = rgbs[..., :224, :224]  # found that the rgb.shape[2] can be 225
+                            assert rgbs.shape[2] == 224 and rgbs.shape[3] == 224
                         else:
-                            rgb = torch.nn.functional.interpolate(rgb, size=(224, 224), mode='bicubic')
+                            rgbs = torch.nn.functional.interpolate(rgbs, size=(224, 224), mode='bicubic')
                         target = torch.nn.functional.interpolate(target, size=(224, 224), mode='bicubic')
-                        stacked = torch.cat([rgb, target], dim=0)
+                        stacked = torch.cat([rgbs, target], dim=0)
                         stacked = clip_utils.CLIP_NORMALIZE(stacked)
-                        rendered_embedding, target_embedding = embed(stacked)
+                        rendered_embedding, rendered_embedding0, target_embedding = embed(stacked)
                     else:
-                        # embedding at target scale
-                        if rgb.shape[2:4] != target.shape[2:4]:
-                            rgb_to_target = torch.nn.functional.interpolate(rgb, size=target.shape[2:4], mode='bicubic')
-                        else:
-                            rgb_to_target = rgb
-                        stacked = torch.cat([rgb_to_target, target], dim=0)
-                        emb_target_scale = embed(stacked)
+                        raise NotImplementedError
 
-                        if args.consistency_crw_multiscale:
-                            # embedding at rendered scale
-                            target_to_rgb = torch.nn.functional.interpolate(target, size=rgb.shape[2:4], mode='bicubic')
-                            stacked = torch.cat([rgb, target_to_rgb], dim=0)
-                            emb_rgb_scale = embed(stacked)
+                        # # embedding at target scale
+                        # if rgb.shape[2:4] != target.shape[2:4]:
+                        #     rgb_to_target = torch.nn.functional.interpolate(rgb, size=target.shape[2:4], mode='bicubic')
+                        # else:
+                        #     rgb_to_target = rgb
+                        # stacked = torch.cat([rgb_to_target, target], dim=0)
+                        # emb_target_scale = embed(stacked)
 
-                            assert emb_target_scale.ndim == 2
-                            emb = torch.cat([emb_target_scale, emb_rgb_scale], dim=1)
-                            rendered_embedding, target_embedding = emb
-                        else:
-                            rendered_embedding, target_embedding = emb_target_scale
+                        # if args.consistency_crw_multiscale:
+                        #     # embedding at rendered scale
+                        #     target_to_rgb = torch.nn.functional.interpolate(target, size=rgb.shape[2:4], mode='bicubic')
+                        #     stacked = torch.cat([rgb, target_to_rgb], dim=0)
+                        #     emb_rgb_scale = embed(stacked)
+
+                        #     assert emb_target_scale.ndim == 2
+                        #     emb = torch.cat([emb_target_scale, emb_rgb_scale], dim=1)
+                        #     rendered_embedding, target_embedding = emb
+                        # else:
+                        #     rendered_embedding, target_embedding = emb_target_scale
+                        
+                        # rendered_embedding0 = None
 
 
 
                 if i%args.i_log_ctr_img==0:
                     metrics['train_ctr/target'] = wandb.Image(target.detach().cpu())
-                    metrics['train_ctr/rgb'] = wandb.Image(rgb.detach().cpu())
+                    metrics['train_ctr/rgb'] = wandb.Image(rgb.detach().permute(2, 0, 1).cpu())
+                    metrics['train_ctr/rgb0'] = wandb.Image(extras['rgb0'].permute(2, 0, 1).detach().cpu())
 
 
         #####  Core optimization loop  #####
@@ -927,7 +938,13 @@ def train():
 
         if calc_ctr_loss:
             consistency_loss = -torch.cosine_similarity(target_embedding, rendered_embedding, dim=-1).mean()
-            loss = loss + consistency_loss * args.consistency_loss_lam
+            # if rendered_embedding0:
+            consistency_loss0 = -torch.cosine_similarity(target_embedding, rendered_embedding0, dim=-1).mean()
+            lam = args.consistency_loss_lam / 2
+            loss = loss + consistency_loss * lam + consistency_loss0 * lam
+            # else:
+            #     assert False  # DEBUG
+                # loss = loss + consistency_loss * args.consistency_loss_lam
 
         loss.backward()
         optimizer.step()
@@ -983,6 +1000,7 @@ def train():
             metrics.update({
                 "train/loss": loss.item(),
                 "train/psnr": psnr.item(),
+                # TODO: log this less frequently
                 "train/tran": wandb.Histogram(trans.detach().cpu().numpy()),
             })
             if args.N_importance > 0:
