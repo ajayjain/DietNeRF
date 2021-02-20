@@ -24,6 +24,7 @@ except ImportError:
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 np.random.seed(0)
+torch.manual_seed(0)
 DEBUG = False
 
 
@@ -491,6 +492,7 @@ def config_parser():
                         help='do not reload weights from saved ckpt')
     parser.add_argument("--ft_path", type=str, default=None, 
                         help='specific weights npy file to reload for coarse network')
+    parser.add_argument("--seed", type=int, default=0)
 
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64, 
@@ -612,6 +614,10 @@ def train():
     wandb.run.name = args.expname
     wandb.run.save()
     wandb.config.update(args)
+
+    # Re-seed
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
 
     # Multi-GPU
     args.n_gpus = torch.cuda.device_count()
