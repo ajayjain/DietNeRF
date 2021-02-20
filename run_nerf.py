@@ -1,19 +1,14 @@
 import IPython
 
-import os, sys
+import os
 import numpy as np
 import imageio
-import json
-import random
 import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 import wandb
-
-import matplotlib.pyplot as plt
 
 from run_nerf_helpers import *
 
@@ -25,11 +20,6 @@ try:
     import clip_utils
 except ImportError:
     print('WARN: Could not import clip_utils')
-
-try:
-    import crw_utils
-except ImportError:
-    print('WARN: Could not import crw_utils')
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -404,7 +394,6 @@ def render_rays(ray_batch,
     pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples, 3]
 
 
-#     raw = run_network(pts)
     raw = network_query_fn(pts, viewdirs, network_fn)
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
@@ -419,7 +408,6 @@ def render_rays(ray_batch,
         pts = rays_o[...,None,:] + rays_d[...,None,:] * z_vals[...,:,None] # [N_rays, N_samples + N_importance, 3]
 
         run_fn = network_fn if network_fine is None else network_fine
-#         raw = run_network(pts, fn=run_fn)
         raw = network_query_fn(pts, viewdirs, run_fn)
 
         rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
@@ -566,6 +554,8 @@ def config_parser():
     # logging/saving options
     parser.add_argument("--i_log",   type=int, default=1, 
                         help='frequency of metric logging')
+    parser.add_argument("--i_log_raw_hist",   type=int, default=2, 
+                        help='frequency of logging histogram of raw network outputs')
     parser.add_argument("--i_log_ctr_img",   type=int, default=100, 
                         help='frequency of train rendering logging')
     parser.add_argument("--i_print",   type=int, default=100, 
@@ -585,16 +575,17 @@ def config_parser():
     parser.add_argument("--max_train_views", type=int, default=-1,
                         help='limit number of training views for the mse loss')
     parser.add_argument("--consistency_loss", type=str, default='none', choices=['none', 'consistent_with_target_rep'])
-    parser.add_argument("--consistency_loss_lam", type=float, default=0.25)
+    parser.add_argument("--consistency_loss_lam", type=float, default=0.2,
+                        help="weight for the fine network's semantic consistency loss")
+    parser.add_argument("--consistency_loss_lam0", type=float, default=0.2,
+                        help="weight for the coarse network's semantic consistency loss")
     parser.add_argument("--consistency_loss_interval", type=float, default=1)
     parser.add_argument("--consistency_nH", type=int, default=32, 
                         help='number of rows to render for consistency loss. smaller values use less memory')
     parser.add_argument("--consistency_nW", type=int, default=32, 
                         help='number of columns to render for consistency loss')
     parser.add_argument("--consistency_jitter_rays", action='store_true')
-    parser.add_argument("--consistency_model_type", type=str, choices=['clip_vit', 'clip_rn50', 'crw_rn18'])
-    # parser.add_argument("--consistency_crw_spatial_reduction", type=str, choices=['mean', 'flatten'])
-    # parser.add_argument("--consistency_crw_multiscale", action='store_true')
+    parser.add_argument("--consistency_model_type", type=str, choices=['clip_vit', 'clip_rn50'])
     parser.add_argument("--checkpoint_rendering", action='store_true')
 
     return parser
@@ -684,7 +675,7 @@ def train():
 
     # Load embedding network for consistency loss
     if args.consistency_loss != 'none':
-        print(f'Using auxilliary consistency loss [{args.consistency_loss}], weight [{args.consistency_loss_lam}]')
+        print(f'Using auxilliary consistency loss [{args.consistency_loss}], fine weight [{args.consistency_loss_lam}], coarse weight [{args.consistency_loss_lam0}]')
         # Load embedding model
         if args.consistency_model_type == 'clip_rn50':
             clip_utils.load_rn()
@@ -694,10 +685,6 @@ def train():
             clip_utils.load_vit()
             embed = lambda ims: clip_utils.clip_model_vit(images_or_text=ims)
             assert not clip_utils.clip_model_vit.training
-        # elif args.consistency_model_type == 'crw_rn18':
-        #     crw_utils.load_rn18()
-        #     embed = lambda ims: crw_utils.embed_image(ims, spatial_reduction=args.consistency_crw_spatial_reduction)
-        #     assert not crw_utils.crw_rn18_model.training
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -863,9 +850,6 @@ def train():
 
                 # rgb0 is the rendering from the coarse network, while rgb uses the fine network
                 rgb, extras = render(H, W, focal, chunk=args.chunk, rays=rays, keep_keys=['rgb_map', 'rgb0'], **render_kwargs_train)
-                if i < start + 5:
-                    # DEBUG
-                    print(i, 'rgb shape', rgb.shape, 'rgb0 shape', extras['rgb0'].shape)
                 rgbs = torch.stack([rgb, extras['rgb0']], dim=0)
                 rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
 
@@ -885,31 +869,6 @@ def train():
                         stacked = torch.cat([rgbs, target], dim=0)
                         stacked = clip_utils.CLIP_NORMALIZE(stacked)
                         rendered_embedding, rendered_embedding0, target_embedding = embed(stacked)
-                    else:
-                        raise NotImplementedError
-
-                        # # embedding at target scale
-                        # if rgb.shape[2:4] != target.shape[2:4]:
-                        #     rgb_to_target = torch.nn.functional.interpolate(rgb, size=target.shape[2:4], mode='bicubic')
-                        # else:
-                        #     rgb_to_target = rgb
-                        # stacked = torch.cat([rgb_to_target, target], dim=0)
-                        # emb_target_scale = embed(stacked)
-
-                        # if args.consistency_crw_multiscale:
-                        #     # embedding at rendered scale
-                        #     target_to_rgb = torch.nn.functional.interpolate(target, size=rgb.shape[2:4], mode='bicubic')
-                        #     stacked = torch.cat([rgb, target_to_rgb], dim=0)
-                        #     emb_rgb_scale = embed(stacked)
-
-                        #     assert emb_target_scale.ndim == 2
-                        #     emb = torch.cat([emb_target_scale, emb_rgb_scale], dim=1)
-                        #     rendered_embedding, target_embedding = emb
-                        # else:
-                        #     rendered_embedding, target_embedding = emb_target_scale
-                        
-                        # rendered_embedding0 = None
-
 
 
                 if i%args.i_log_ctr_img==0:
@@ -938,13 +897,9 @@ def train():
 
         if calc_ctr_loss:
             consistency_loss = -torch.cosine_similarity(target_embedding, rendered_embedding, dim=-1).mean()
-            # if rendered_embedding0:
             consistency_loss0 = -torch.cosine_similarity(target_embedding, rendered_embedding0, dim=-1).mean()
-            lam = args.consistency_loss_lam / 2
-            loss = loss + consistency_loss * lam + consistency_loss0 * lam
-            # else:
-            #     assert False  # DEBUG
-                # loss = loss + consistency_loss * args.consistency_loss_lam
+            loss = (loss + consistency_loss * args.consistency_loss_lam +
+                    consistency_loss0 * args.consistency_loss_lam0)
 
         loss.backward()
         optimizer.step()
@@ -1000,13 +955,19 @@ def train():
             metrics.update({
                 "train/loss": loss.item(),
                 "train/psnr": psnr.item(),
-                # TODO: log this less frequently
-                "train/tran": wandb.Histogram(trans.detach().cpu().numpy()),
+                "train/mse": img_loss.item(),
+                "train/mse0": img_loss0.item(),
+                "gradients/norm": gradient_norm(network_fine.parameters()),
+                "gradients/norm0": gradient_norm(network_fn.parameters()),
             })
             if args.N_importance > 0:
                 metrics["train/psnr0"] = psnr0.item()
             if calc_ctr_loss:
                 metrics["train_ctr/consistency_loss"] = consistency_loss.item()
+                metrics["train_ctr/consistency_loss0"] = consistency_loss0.item()
+
+        if i%args.i_log_raw_hist==0:
+            metrics["train/tran"] = wandb.Histogram(trans.detach().cpu().numpy())
 
         if i%args.i_img==0:
             # Log a rendered validation view to Tensorboard

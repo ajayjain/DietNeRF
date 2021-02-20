@@ -289,3 +289,13 @@ def sample_pdf(bins, weights, N_samples, det=False, pytest=False):
     samples = bins_g[...,0] + t * (bins_g[...,1]-bins_g[...,0])
 
     return samples
+
+
+def gradient_norm(parameters):
+    # https://discuss.pytorch.org/t/check-the-norm-of-gradients/27961
+    total_norm = 0.
+    for p in parameters:
+        param_norm = p.grad.data.norm(2)
+        total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** (1. / 2)
+    return total_norm
