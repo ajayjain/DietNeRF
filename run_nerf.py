@@ -595,6 +595,7 @@ def config_parser():
     parser.add_argument("--checkpoint_rendering", action='store_true')
 
     parser.add_argument("--consistency_poses", type=str, choices=['loaded', 'uniform'], default='loaded')
+    parser.add_argument("--consistency_poses_translation_jitter_sigma", type=float, default=0.)
     # Options for --consistency_poses=uniform
     parser.add_argument("--consistency_theta_range", type=float, nargs=2)
     parser.add_argument("--consistency_phi_range", type=float, nargs=2)
@@ -873,10 +874,6 @@ def train():
             if calc_ctr_loss and ctr_loss_iter:
                 with torch.no_grad():
                     # Render from a random viewpoint
-                    import IPython
-                    IPython.embed()
-                    import sys
-                    sys.exit()
                     if args.consistency_poses == 'loaded':
                         poses_i = np.random.choice(i_train_poses)
                         pose = poses[poses_i, :3,:4]
@@ -884,6 +881,9 @@ def train():
                         assert args.dataset_type == 'blender'
                         pose = pose_spherical_uniform(args.consistency_theta_range, args.consistency_phi_range, args.consistency_radius_range)
                         pose = pose[:3, :4]
+
+                    if args.consistency_poses_translation_jitter_sigma > 0:
+                        pose[:, -1] = pose[:, -1] + torch.randn(3, device=pose.device) * args.consistency_poses_translation_jitter_sigma
 
                     # TODO: something strange with pts_W in get_rays when 224 nH
                     rays = get_rays(H, W, focal, c2w=pose, nH=args.consistency_nH, nW=args.consistency_nW,
