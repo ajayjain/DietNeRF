@@ -7,3 +7,6 @@ configargparse
 tensorboard==1.14.0
 tqdm
 opencv-python
+ftfy
+wandb
+regex

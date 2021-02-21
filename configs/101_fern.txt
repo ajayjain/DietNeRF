@@ -1,0 +1,20 @@
+# Baseline NeRF with all views
+expname = 101_fern_4views
+basedir = ./logs
+datadir = ./data/nerf_llff_data/fern
+dataset_type = llff
+
+factor = 8
+llffhold = 8
+
+N_rand = 1024
+N_samples = 64
+N_importance = 64
+
+use_viewdirs = True
+raw_noise_std = 1e0
+
+# Modifications from fern.txt below
+save_splits = True
+max_train_views = 4
+consistency_loss = none

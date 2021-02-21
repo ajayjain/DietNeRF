@@ -823,7 +823,8 @@ def train():
     print('VAL views are', i_val)
 
     # Embed training images for consistency loss
-    if args.consistency_loss != 'none':
+    calc_ctr_loss = args.consistency_loss.startswith('consistent_with_target_rep')
+    if calc_ctr_loss:
         with torch.no_grad():
             assert args.consistency_model_type.startswith('clip_')
             targets = images[i_train]
@@ -868,8 +869,8 @@ def train():
             target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
             # Representational consistency loss with rendered image
-            calc_ctr_loss = args.consistency_loss.startswith('consistent_with_target_rep') and (i % args.consistency_loss_interval == 0)
-            if calc_ctr_loss:
+            ctr_loss_iter = i % args.consistency_loss_interval == 0
+            if calc_ctr_loss and ctr_loss_iter:
                 with torch.no_grad():
                     # Render from a random viewpoint
                     if args.consistency_poses == 'loaded':
@@ -935,7 +936,7 @@ def train():
             psnr0 = mse2psnr(img_loss0)
 
         consistency_loss = None
-        if calc_ctr_loss:
+        if calc_ctr_loss and ctr_loss_iter:
             if args.consistency_reembed_target:
                 consistency_loss = -torch.cosine_similarity(
                     target_embedding, rendered_embedding, dim=-1).mean()
@@ -1020,7 +1021,7 @@ def train():
            })
             if args.N_importance > 0:
                 metrics["train/psnr0"] = psnr0.item()
-            if calc_ctr_loss:
+            if calc_ctr_loss and ctr_loss_iter:
                 metrics["train_ctr/consistency_loss"] = consistency_loss.item()
                 metrics["train_ctr/consistency_loss0"] = consistency_loss0.item()
 
