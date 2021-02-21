@@ -873,6 +873,10 @@ def train():
             if calc_ctr_loss and ctr_loss_iter:
                 with torch.no_grad():
                     # Render from a random viewpoint
+                    import IPython
+                    IPython.embed()
+                    import sys
+                    sys.exit()
                     if args.consistency_poses == 'loaded':
                         poses_i = np.random.choice(i_train_poses)
                         pose = poses[poses_i, :3,:4]
