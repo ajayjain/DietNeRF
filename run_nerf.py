@@ -16,10 +16,7 @@ from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data, pose_spherical_uniform
 
-try:
-    import clip_utils
-except ImportError:
-    print('WARN: Could not import clip_utils')
+import clip_utils
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
