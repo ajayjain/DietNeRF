@@ -3,6 +3,7 @@ import IPython
 import os
 import numpy as np
 import imageio
+from scipy.spatial.transform import Rotation
 import time
 import torch
 import torch.nn as nn
@@ -17,6 +18,7 @@ from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data, pose_spherical_uniform
 
 import clip_utils
+import geometry
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -591,8 +593,9 @@ def config_parser():
     parser.add_argument("--consistency_model_type", type=str, choices=['clip_vit', 'clip_rn50'])
     parser.add_argument("--checkpoint_rendering", action='store_true')
 
-    parser.add_argument("--consistency_poses", type=str, choices=['loaded', 'uniform'], default='loaded')
+    parser.add_argument("--consistency_poses", type=str, choices=['loaded', 'interpolate_train_all', 'uniform'], default='loaded')
     parser.add_argument("--consistency_poses_translation_jitter_sigma", type=float, default=0.)
+    parser.add_argument("--consistency_poses_interpolate_range", type=float, nargs=2, default=[0., 1.])
     # Options for --consistency_poses=uniform
     parser.add_argument("--consistency_theta_range", type=float, nargs=2)
     parser.add_argument("--consistency_phi_range", type=float, nargs=2)
@@ -873,11 +876,19 @@ def train():
                     # Render from a random viewpoint
                     if args.consistency_poses == 'loaded':
                         poses_i = np.random.choice(i_train_poses)
-                        pose = poses[poses_i, :3,:4]
+                        pose = poses[poses_i, :3, :4]
+                    elif args.consistency_poses == 'interpolate_train_all':
+                        assert len(i_train_poses) >= 3
+                        poses_i = np.random.choice(i_train_poses, size=3, replace=False)
+                        pose1, pose2, pose3 = poses[poses_i, :3, :4].cpu()
+                        s12, s3 = np.random.uniform(*args.consistency_poses_interpolate_range, size=2)
+                        pose = geometry.interp3(pose1, pose2, pose3, s12, s3)
                     elif args.consistency_poses == 'uniform':
                         assert args.dataset_type == 'blender'
                         pose = pose_spherical_uniform(args.consistency_theta_range, args.consistency_phi_range, args.consistency_radius_range)
                         pose = pose[:3, :4]
+
+                    print('Sampled pose:', Rotation.from_matrix(pose[:, :3].cpu()).as_rotvec(), 'origin:', pose[:, 3])
 
                     if args.consistency_poses_translation_jitter_sigma > 0:
                         pose[:, -1] = pose[:, -1] + torch.randn(3, device=pose.device) * args.consistency_poses_translation_jitter_sigma

@@ -1,0 +1,45 @@
+# NeRF + consistency loss with 2 views based on 108. Like 108, it uses
+#   non-square rendering for ctr,
+#   less frequent consistency loss: every 16 iters
+# This run adds in random 3-point pose interpolation for the renderings
+#   no extrapolation - interpolate between 3 with weights in [0, 1]
+expname = 111_fern_2views_ctr_coarseandfine_clip_vit_reuseemb_interppose
+basedir = ./logs
+datadir = ./data/nerf_llff_data/fern
+dataset_type = llff
+
+factor = 8
+llffhold = 8
+
+N_rand = 1024
+N_samples = 64
+N_importance = 64
+
+use_viewdirs = True
+raw_noise_std = 1e0
+
+# Modifications from fern.txt below
+save_splits = True
+max_train_views = 2
+
+consistency_loss = consistent_with_target_rep
+consistency_loss_lam = 0.1
+consistency_loss_lam0 = 0.1
+consistency_loss_interval = 16
+consistency_nH = 189
+consistency_nW = 252
+consistency_jitter_rays = True
+consistency_model_type = clip_vit
+
+consistency_reembed_target = False
+consistency_poses = interpolate_train_all
+consistency_poses_translation_jitter_sigma = 0.
+consistency_poses_interpolate_range = [0, 1.]
+
+checkpoint_rendering = True
+
+i_log_raw_hist = 2
+i_log_ctr_img = 16
+i_video = 6250
+
+no_batching = True
