@@ -4,6 +4,7 @@ import os
 import numpy as np
 import imageio
 from scipy.spatial.transform import Rotation
+import sys
 import time
 import torch
 import torch.nn as nn
@@ -324,12 +325,12 @@ def render_rays(ray_batch,
                 N_samples,
                 retraw=False,
                 lindisp=False,
+                verbose=False,
                 perturb=0.,
                 N_importance=0,
                 network_fine=None,
                 white_bkgd=False,
                 raw_noise_std=0.,
-                verbose=False,
                 pytest=False):
     """Volumetric rendering.
     Args:
@@ -416,6 +417,7 @@ def render_rays(ray_batch,
     ret['disp_map'] = disp_map
     ret['acc_map'] = acc_map
     if retraw:
+        ret['pts'] = pts
         ret['raw'] = raw
     if N_importance > 0:
         ret['rgb0'] = rgb_map_0
@@ -603,6 +605,9 @@ def config_parser():
 
     parser.add_argument("--consistency_reembed_target", action='store_true',
                         help='reembed target image each iteration that the consistency loss is computed')
+    parser.add_argument("--dump_consistency_data", action='store_true')
+
+    parser.add_argument("--no_mse", action='store_true')
 
     return parser
 
@@ -698,7 +703,7 @@ def train():
         print(f'Using auxilliary consistency loss [{args.consistency_loss}], fine weight [{args.consistency_loss_lam}], coarse weight [{args.consistency_loss_lam0}]')
         # Load embedding model
         if args.consistency_model_type == 'clip_rn50':
-            clip_utils.load_rn()
+            clip_utils.load_rn(jit=False)
             embed = lambda ims: clip_utils.clip_model_rn(images_or_text=clip_utils.CLIP_NORMALIZE(ims))
             assert not clip_utils.clip_model_rn.training
         elif args.consistency_model_type == 'clip_vit':
@@ -898,7 +903,12 @@ def train():
                                     jitter=args.consistency_jitter_rays)
 
                 # rgb0 is the rendering from the coarse network, while rgb uses the fine network
-                rgb, extras = render(H, W, focal, chunk=args.chunk, rays=rays, keep_keys=['rgb_map', 'rgb0'], **render_kwargs_train)
+                keep_keys = ['rgb_map', 'rgb0']
+                if args.dump_consistency_data:
+                    keep_keys = ['rgb_map', 'rgb0', 'raw', 'pts']
+                rgb, extras = render(H, W, focal, chunk=args.chunk, rays=rays,
+                                     keep_keys=keep_keys, retraw=args.dump_consistency_data,
+                                     **render_kwargs_train)
                 rgbs = torch.stack([rgb, extras['rgb0']], dim=0)
                 rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
 
@@ -916,10 +926,31 @@ def train():
                             rgbs = torch.nn.functional.interpolate(rgbs, size=(224, 224), mode='bicubic')
 
                         if args.consistency_reembed_target:
+                            old_target = target
                             target = torch.nn.functional.interpolate(target, size=(224, 224), mode='bicubic')
                             stacked = torch.cat([rgbs, target], dim=0)
                             stacked = clip_utils.CLIP_NORMALIZE(stacked)
-                            rendered_embedding, rendered_embedding0, target_embedding = embed(stacked)
+                            stacked_embeddings = embed(stacked)
+                            rendered_embedding, rendered_embedding0, target_embedding = stacked_embeddings
+
+                            if args.dump_consistency_data:
+                                spatial_features = clip_utils.clip_model_rn.module.clip_model.visual.featurize(stacked.type(torch.float16))
+                                out_path = os.path.join(basedir, expname, 'consistency_data.pth')
+                                torch.save({
+                                    'rays': rays,
+                                    'rgb': rgb,
+                                    'extras': extras,
+                                    'rgbs': rgbs,
+                                    'target': target,
+                                    'old_target': old_target,
+                                    'rendered_pose': pose,
+                                    'target_pose': poses[img_i, :3,:4],
+                                    'stacked_embeddings': stacked_embeddings,
+                                    'spatial_features': spatial_features,
+                                    'HWF': (H,W,focal),
+                                }, out_path)
+                                print('Saved c2w poses, rays, renderings and embeddings to', out_path)
+                                sys.exit()
                         else:
                             rendered_embedding, rendered_embedding0 = embed(rgbs)
 
@@ -946,6 +977,9 @@ def train():
             img_loss0 = img2mse(extras['rgb0'], target_s)
             loss = loss + img_loss0
             psnr0 = mse2psnr(img_loss0)
+
+        if args.no_mse:
+            loss = 0
 
         consistency_loss = None
         if calc_ctr_loss and ctr_loss_iter:

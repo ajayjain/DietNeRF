@@ -1,0 +1,45 @@
+# Baseline NeRF with all views. adds consistency loss arguments
+# to dump rendering data to disk.
+expname = 112_fern_allviews_dumpdata
+basedir = ./logs
+datadir = ./data/nerf_llff_data/fern
+dataset_type = llff
+
+factor = 8
+llffhold = 8
+
+N_rand = 1024
+N_samples = 64
+N_importance = 64
+
+use_viewdirs = True
+raw_noise_std = 1e0
+
+# Modifications from fern.txt below
+save_splits = True
+max_train_views = -1
+consistency_loss = none
+
+# Modifications to run consistency code, to export
+# rays for developing image correspondance code.
+# Taken from 111_fern.txt.
+consistency_loss = consistent_with_target_rep
+consistency_loss_lam = 0.1
+consistency_loss_lam0 = 0.1
+consistency_loss_interval = 16
+consistency_nH = 189
+consistency_nW = 252
+consistency_jitter_rays = True
+
+consistency_poses = interpolate_train_all
+consistency_poses_translation_jitter_sigma = 0.
+consistency_poses_interpolate_range = [0, 1.]
+
+checkpoint_rendering = True
+
+no_batching = True
+
+# Additional modifications from 111
+consistency_reembed_target = True
+consistency_model_type = clip_rn50
+dump_consistency_data = True
