@@ -1,0 +1,56 @@
+# As in 112, dump consistency data using pre-trained weights with NeRF trained on all views
+expname = 061_blender_paper_lego_dump
+basedir = ./logs
+datadir = ./data/nerf_synthetic/lego
+dataset_type = blender
+
+no_batching = True
+
+use_viewdirs = True
+white_bkgd = True
+lrate_decay = 500
+
+N_samples = 64
+N_importance = 128
+N_rand = 1024
+
+precrop_iters = 500
+precrop_frac = 0.5
+
+half_res = True
+
+# Modifications from fern.txt below
+save_splits = True
+max_train_views = -1
+
+# Modifications to run consistency code, to export
+# rays for developing image correspondance code.
+consistency_loss = consistent_with_target_rep
+consistency_loss_lam = 0.1
+consistency_loss_lam0 = 0.1
+consistency_loss_interval = 10
+consistency_nH = 168
+consistency_nW = 168
+consistency_jitter_rays = False
+consistency_model_type = clip_vit
+#### Number of transformer layers to run for ctr loss
+consistency_model_num_layers = -1
+#### Added these 3 args to be explicit
+consistency_size = 224
+consistency_interp_mode = bicubic
+consistency_loss_comparison = cosine_sim
+####
+
+consistency_poses = uniform
+consistency_theta_range = [-180, 180]
+consistency_phi_range = [-90, 0]
+consistency_radius_range = [3.5, 4.5]
+
+checkpoint_rendering = True
+
+no_batching = True
+
+# Additional modifications
+consistency_reembed_target = True
+consistency_model_type = clip_rn50
+dump_consistency_data = True

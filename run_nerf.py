@@ -144,7 +144,7 @@ def render(H, W, focal, chunk=1024*32, rays=None, c2w=None, ndc=True,
     if keep_keys:
         k_extract = [k for k in k_extract if k in keep_keys]
     ret_list = [all_ret[k] for k in k_extract]
-    ret_dict = {k : all_ret[k] for k in all_ret if k not in k_extract}
+    ret_dict = {k : all_ret[k] for k in all_ret}
     return ret_list + [ret_dict]
 
 
@@ -402,7 +402,7 @@ def render_rays(ray_batch,
     rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
 
     if N_importance > 0:
-        rgb_map_0, disp_map_0, acc_map_0 = rgb_map, disp_map, acc_map
+        pts0, raw0, rgb_map_0, disp_map_0, acc_map_0, weights0 = pts, raw, rgb_map, disp_map, acc_map, weights
 
         z_vals_mid = .5 * (z_vals[...,1:] + z_vals[...,:-1])
         z_samples = sample_pdf(z_vals_mid, weights[...,1:-1], N_importance, det=(perturb==0.), pytest=pytest)
@@ -419,14 +419,18 @@ def render_rays(ray_batch,
     ret = {'rgb_map' : rgb_map}
     ret['disp_map'] = disp_map
     ret['acc_map'] = acc_map
+    ret['weights'] = weights
+    ret['pts'] = pts
     if retraw:
-        ret['pts'] = pts
         ret['raw'] = raw
+        ret['raw0'] = raw0
     if N_importance > 0:
         ret['rgb0'] = rgb_map_0
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
         ret['z_std'] = torch.std(z_samples, dim=-1, unbiased=False)  # [N_rays]
+        ret['pts0'] = pts0
+        ret['weights0'] = weights0
 
     for k in ret:
         if (torch.isnan(ret[k]).any() or torch.isinf(ret[k]).any()) and DEBUG:
@@ -583,7 +587,8 @@ def config_parser():
 
     parser.add_argument("--consistency_loss", type=str, default='none', choices=[
         'none', 'consistent_with_target_rep', 'consistent_with_target_reps_mean', 'consistent_with_target_reps_min'])
-    parser.add_argument("--consistency_loss_comparison", type=str, default=['cosine_sim'], nargs='+', choices=['cosine_sim', 'mse', 'max_patch_match_sametarget'])
+    parser.add_argument("--consistency_loss_comparison", type=str, default=['cosine_sim'], nargs='+', choices=[
+        'cosine_sim', 'mse', 'max_patch_match_sametarget', 'max_patch_match_alltargets'])
     parser.add_argument("--consistency_loss_lam", type=float, default=0.2,
                         help="weight for the fine network's semantic consistency loss")
     parser.add_argument("--consistency_loss_lam0", type=float, default=0.2,
@@ -936,11 +941,11 @@ def train():
                 # rgb0 is the rendering from the coarse network, while rgb uses the fine network
                 keep_keys = ['rgb_map', 'rgb0']
                 if args.dump_consistency_data:
-                    keep_keys = ['rgb_map', 'rgb0', 'raw', 'pts']
-                rgb, extras = render(H, W, focal, chunk=args.chunk, rays=rays,
-                                     keep_keys=keep_keys, retraw=args.dump_consistency_data,
-                                     **render_kwargs_train)
-                rgbs = torch.stack([rgb, extras['rgb0']], dim=0)
+                    keep_keys = ['rgb_map', 'rgb0', 'pts', 'pts0', 'weights', 'weights0', 'acc_map', 'acc0']
+                extras = render(H, W, focal, chunk=args.chunk, rays=rays,
+                                keep_keys=keep_keys,
+                                **render_kwargs_train)[-1]
+                rgbs = torch.stack([extras['rgb_map'], extras['rgb0']], dim=0)
                 rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
 
                 with torch.cuda.amp.autocast():
@@ -968,7 +973,7 @@ def train():
                             out_path = os.path.join(basedir, expname, 'consistency_data.pth')
                             torch.save({
                                 'rays': rays,
-                                'rgb': rgb,
+                                'rgb': extras['rgb_map'],
                                 'extras': extras,
                                 'rgbs': rgbs,
                                 'target': target,
@@ -1050,8 +1055,14 @@ def train():
                         sim = torch.matmul(embs2, embs1.transpose(0,1))  # [B,L2,L1]
                         return sim.view(-1, embs1.shape[0]).transpose(0,1)  # [L1,B*L2]
 
-                    # if 'max_patch_match_alltargets' in args.consistency_loss_comparison:
-                    #     raise NotImplementedError
+                    if 'max_patch_match_alltargets' in args.consistency_loss_comparison:
+                        patch_sim = get_patch_similarity_matrix(rendered_embedding[1:], target_embeddings[:, 1:])  # [L-1,num_targ*(L-1)]
+                        max_patch_sim, _ = torch.max(patch_sim, dim=1)  # max across target patches
+                        consistency_loss.append(-torch.mean(max_patch_sim))  # mean across rendered patches
+
+                        patch_sim0 = get_patch_similarity_matrix(rendered_embedding0[1:], target_embeddings[:, 1:])
+                        max_patch_sim0, _ = torch.max(patch_sim0, dim=1)
+                        consistency_loss0.append(-torch.mean(max_patch_sim0))
 
                     if 'max_patch_match_sametarget' in args.consistency_loss_comparison:
                         patch_sim = get_patch_similarity_matrix(
