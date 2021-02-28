@@ -1,0 +1,46 @@
+# Based off of 042, but uses timm's inception_v4
+expname = 054_blender_lego_ctr_timm_inception_v4_coarseandfine_reuseemb_uniformpose
+basedir = ./logs
+datadir = ./data/nerf_synthetic/lego
+dataset_type = blender
+
+no_batching = True
+
+use_viewdirs = True
+white_bkgd = True
+lrate_decay = 500
+
+N_samples = 64
+N_importance = 128
+N_rand = 1024
+chunk = 32768
+
+precrop_iters = 500
+precrop_frac = 0.5
+
+half_res = True
+
+max_train_views = 8
+consistency_loss = consistent_with_target_rep
+consistency_loss_lam = 0.1
+consistency_loss_lam0 = 0.1
+consistency_loss_interval = 10
+consistency_nH = 168
+consistency_nW = 168
+consistency_jitter_rays = True
+consistency_model_type = timm_inception_v4
+consistency_size = 224
+consistency_interp_mode = bicubic
+consistency_loss_comparison = cosine_sim
+
+consistency_reembed_target = False
+consistency_poses = uniform
+consistency_theta_range = [-180, 180]
+consistency_phi_range = [-90, 0]
+consistency_radius_range = [3.5, 4.5]
+
+checkpoint_rendering = True
+
+i_log_raw_hist = 2
+i_log_ctr_img = 10
+i_video = 6250

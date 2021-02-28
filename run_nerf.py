@@ -9,6 +9,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 from tqdm import tqdm, trange
 import wandb
 
@@ -19,6 +20,8 @@ from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data, pose_spherical_uniform
 
 import clip_utils
+import timm
+
 import geometry
 
 
@@ -580,6 +583,7 @@ def config_parser():
 
     parser.add_argument("--consistency_loss", type=str, default='none', choices=[
         'none', 'consistent_with_target_rep', 'consistent_with_target_reps_mean', 'consistent_with_target_reps_min'])
+    parser.add_argument("--consistency_loss_comparison", type=str, default='cosine_sim', choices=['cosine_sim', 'mse'])
     parser.add_argument("--consistency_loss_lam", type=float, default=0.2,
                         help="weight for the fine network's semantic consistency loss")
     parser.add_argument("--consistency_loss_lam0", type=float, default=0.2,
@@ -591,8 +595,13 @@ def config_parser():
                         help='number of rows to render for consistency loss. smaller values use less memory')
     parser.add_argument("--consistency_nW", type=int, default=32, 
                         help='number of columns to render for consistency loss')
+    parser.add_argument("--consistency_size", type=int, default=224)
+    parser.add_argument("--consistency_interp_mode", type=str, default='bicubic')
     parser.add_argument("--consistency_jitter_rays", action='store_true')
-    parser.add_argument("--consistency_model_type", type=str, choices=['clip_vit', 'clip_rn50'])
+    # Consistency model arguments
+    parser.add_argument("--consistency_model_type", type=str, default='clip_vit') # choices=['clip_vit', 'clip_rn50']
+    parser.add_argument("--consistency_model_num_layers", type=int, default=-1)
+
     parser.add_argument("--checkpoint_rendering", action='store_true')
 
     parser.add_argument("--consistency_poses", type=str, choices=['loaded', 'interpolate_train_all', 'uniform'], default='loaded')
@@ -702,14 +711,37 @@ def train():
     if args.consistency_loss != 'none':
         print(f'Using auxilliary consistency loss [{args.consistency_loss}], fine weight [{args.consistency_loss_lam}], coarse weight [{args.consistency_loss_lam0}]')
         # Load embedding model
-        if args.consistency_model_type == 'clip_rn50':
-            clip_utils.load_rn(jit=False)
-            embed = lambda ims: clip_utils.clip_model_rn(images_or_text=clip_utils.CLIP_NORMALIZE(ims))
-            assert not clip_utils.clip_model_rn.training
-        elif args.consistency_model_type == 'clip_vit':
-            clip_utils.load_vit()
-            embed = lambda ims: clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims))
-            assert not clip_utils.clip_model_vit.training
+        if args.consistency_model_type.startswith('clip_'):
+            if args.consistency_model_type == 'clip_rn50':
+                clip_utils.load_rn(num_layers=args.consistency_model_num_layers, jit=False)
+                embed = lambda ims: clip_utils.clip_model_rn(images_or_text=clip_utils.CLIP_NORMALIZE(ims))
+                assert not clip_utils.clip_model_rn.training
+            elif args.consistency_model_type == 'clip_vit':
+                clip_utils.load_vit(num_layers=args.consistency_model_num_layers)
+                embed = lambda ims: clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims))
+                assert not clip_utils.clip_model_vit.training
+        elif args.consistency_model_type.startswith('timm_'):
+            assert args.consistency_model_num_layers == -1
+
+            model_type = args.consistency_model_type[len('timm_'):]
+            encoder = timm.create_model(model_type, pretrained=True, num_classes=0)
+            encoder.eval()
+            normalize = torchvision.transforms.Normalize(
+                encoder.default_cfg['mean'], encoder.default_cfg['std'])  # normalize an image that is already scaled to [0, 1]
+            encoder = nn.DataParallel(encoder).to(device)
+            embed = lambda ims: encoder(normalize(ims))
+        elif args.consistency_model_type.startswith('torch_'):
+            assert args.consistency_model_num_layers == -1
+
+            model_type = args.consistency_model_type[len('torch_'):]
+            encoder = torch.hub.load('pytorch/vision:v0.6.0', model_type, pretrained=True)
+            encoder.eval()
+            encoder = nn.DataParallel(encoder).to(device)
+            normalize = torchvision.transforms.Normalize(
+                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # normalize an image that is already scaled to [0, 1]
+            embed = lambda ims: encoder(normalize(ims))
+        else:
+            raise ValueError
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -832,12 +864,11 @@ def train():
     calc_ctr_loss = args.consistency_loss.startswith('consistent_with_target_rep')
     if calc_ctr_loss:
         with torch.no_grad():
-            assert args.consistency_model_type.startswith('clip_')
             targets = images[i_train]
             targets = targets.permute(0, 3, 1, 2)
             if args.consistency_target_augmentation != 'none':
                 raise NotImplementedError
-            targets = torch.nn.functional.interpolate(targets, size=(224, 224), mode='bicubic')
+            targets = torch.nn.functional.interpolate(targets, size=(args.consistency_size, args.consistency_size), mode=args.consistency_interp_mode)
             target_embeddings = embed(targets)
 
     start = start + 1
@@ -916,43 +947,42 @@ def train():
                     if i == 0:
                         print('consistency loss rendered rgb image shape:', rgbs.shape)
 
+                    # Resize rendered images
                     target = target.permute(2, 0, 1).unsqueeze(0)
-                    if args.consistency_model_type.startswith('clip_'):
-                        # Resize for CLIP network
-                        if args.consistency_nH == 224 and args.consistency_nW == 224:
-                            rgbs = rgbs[..., :224, :224]  # found that the rgb.shape[2] can be 225
-                            assert rgbs.shape[2] == 224 and rgbs.shape[3] == 224
-                        else:
-                            rgbs = torch.nn.functional.interpolate(rgbs, size=(224, 224), mode='bicubic')
+                    if args.consistency_nH == args.consistency_size and args.consistency_nW == args.consistency_size:
+                        rgbs = rgbs[..., :args.consistency_size, :args.consistency_size]  # found that the rgb.shape[2] can be 225
+                        assert rgbs.shape[2] == args.consistency_size and rgbs.shape[3] == args.consistency_size
+                    else:
+                        rgbs = torch.nn.functional.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.consistency_interp_mode)
 
-                        if args.consistency_reembed_target:
-                            old_target = target
-                            target = torch.nn.functional.interpolate(target, size=(224, 224), mode='bicubic')
-                            stacked = torch.cat([rgbs, target], dim=0)
-                            stacked = clip_utils.CLIP_NORMALIZE(stacked)
-                            stacked_embeddings = embed(stacked)
-                            rendered_embedding, rendered_embedding0, target_embedding = stacked_embeddings
+                    # Embed rendered images
+                    if args.consistency_reembed_target:
+                        old_target = target
+                        target = torch.nn.functional.interpolate(target, size=(args.consistency_size, args.consistency_size), mode=args.consistency_interp_mode)
+                        stacked = torch.cat([rgbs, target], dim=0)
+                        stacked_embeddings = embed(stacked)
+                        rendered_embedding, rendered_embedding0, target_embedding = stacked_embeddings
 
-                            if args.dump_consistency_data:
-                                spatial_features = clip_utils.clip_model_rn.module.clip_model.visual.featurize(stacked.type(torch.float16))
-                                out_path = os.path.join(basedir, expname, 'consistency_data.pth')
-                                torch.save({
-                                    'rays': rays,
-                                    'rgb': rgb,
-                                    'extras': extras,
-                                    'rgbs': rgbs,
-                                    'target': target,
-                                    'old_target': old_target,
-                                    'rendered_pose': pose,
-                                    'target_pose': poses[img_i, :3,:4],
-                                    'stacked_embeddings': stacked_embeddings,
-                                    'spatial_features': spatial_features,
-                                    'HWF': (H,W,focal),
-                                }, out_path)
-                                print('Saved c2w poses, rays, renderings and embeddings to', out_path)
-                                sys.exit()
-                        else:
-                            rendered_embedding, rendered_embedding0 = embed(rgbs)
+                        if args.dump_consistency_data:
+                            spatial_features = clip_utils.clip_model_rn.module.clip_model.visual.featurize(stacked.type(torch.float16))
+                            out_path = os.path.join(basedir, expname, 'consistency_data.pth')
+                            torch.save({
+                                'rays': rays,
+                                'rgb': rgb,
+                                'extras': extras,
+                                'rgbs': rgbs,
+                                'target': target,
+                                'old_target': old_target,
+                                'rendered_pose': pose,
+                                'target_pose': poses[img_i, :3,:4],
+                                'stacked_embeddings': stacked_embeddings,
+                                'spatial_features': spatial_features,
+                                'HWF': (H,W,focal),
+                            }, out_path)
+                            print('Saved c2w poses, rays, renderings and embeddings to', out_path)
+                            sys.exit()
+                    else:
+                        rendered_embedding, rendered_embedding0 = embed(rgbs)
 
                 if i%args.i_log_ctr_img==0:
                     metrics['train_ctr/target'] = wandb.Image(target.detach().cpu())
@@ -984,6 +1014,8 @@ def train():
         consistency_loss = None
         if calc_ctr_loss and ctr_loss_iter:
             if args.consistency_reembed_target:
+                assert args.consistency_loss == 'consistent_with_target_rep'
+                assert args.consistency_loss_comparison == 'cosine_sim'
                 consistency_loss = -torch.cosine_similarity(
                     target_embedding, rendered_embedding, dim=-1).mean()
                 consistency_loss0 = -torch.cosine_similarity(
@@ -993,10 +1025,15 @@ def train():
                     # NOTE: Randomly sampling a target (run 031) is worse than sampling the same target as MSE (run 032)
                     # target_i = np.random.randint(len(target_embeddings))
                     target_i = np.where(i_train == img_i)[0][0]  # same target as used for the MSE loss
-                    consistency_loss = -torch.cosine_similarity(
-                        target_embeddings[target_i], rendered_embedding, dim=-1)
-                    consistency_loss0 = -torch.cosine_similarity(
-                        target_embeddings[target_i], rendered_embedding0, dim=-1)
+
+                    if args.consistency_loss_comparison == 'cosine_sim':
+                        consistency_loss = -torch.cosine_similarity(
+                            target_embeddings[target_i], rendered_embedding, dim=-1)
+                        consistency_loss0 = -torch.cosine_similarity(
+                            target_embeddings[target_i], rendered_embedding0, dim=-1)
+                    elif args.consistency_loss_comparison == 'mse':
+                        consistency_loss = F.mse_loss(rendered_embedding, target_embeddings[target_i].unsqueeze(0))
+                        consistency_loss0 = F.mse_loss(rendered_embedding0, target_embeddings[target_i].unsqueeze(0))
                 elif args.consistency_loss.startswith('consistent_with_target_reps'):
                     raise NotImplementedError  # DEBUG: temporary, need to add consistency_loss0
 
