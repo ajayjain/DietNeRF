@@ -1,3 +1,4 @@
+import functools
 import IPython
 
 import os
@@ -9,6 +10,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as run_checkpoint
 import torchvision
 from tqdm import tqdm, trange
 import wandb
@@ -462,6 +464,135 @@ def sample_rays(H, W, rays_o, rays_d, N_rand, i, start, precrop_iters, precrop_f
     return batch_rays, select_coords
 
 
+def get_embed_fn(model_type, num_layers=-1, spatial=False, checkpoint=False):
+    if model_type.startswith('clip_'):
+        if model_type == 'clip_rn50':
+            clip_utils.load_rn(num_layers=num_layers, jit=False)
+            if spatial:
+                _clip_dtype = clip_utils.clip_model_rn.module.clip_model.dtype
+                def embed(ims):
+                    ims = clip_utils.CLIP_NORMALIZE(ims).type(_clip_dtype)
+                    return clip_utils.clip_model_rn.module.clip_model.visual.featurize(ims)  # [N,C,56,56]
+            else:
+                embed = lambda ims: clip_utils.clip_model_rn(images_or_text=clip_utils.CLIP_NORMALIZE(ims)).unsqueeze(1)
+            assert not clip_utils.clip_model_rn.training
+        elif model_type == 'clip_vit':
+            clip_utils.load_vit(num_layers=num_layers)
+            if spatial:
+                def embed(ims):
+                    emb = clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims))  # [N,L=50,D]
+                    return emb[:, 1:].view(emb.shape[0], 7, 7, emb.shape[2])  # [N,7,7,D]
+            else:
+                embed = lambda ims: clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims))  # [N,L=50,D]
+            assert not clip_utils.clip_model_vit.training
+    elif model_type.startswith('timm_'):
+        assert num_layers == -1
+        assert not spatial
+
+        model_type = model_type[len('timm_'):]
+        encoder = timm.create_model(model_type, pretrained=True, num_classes=0)
+        encoder.eval()
+        normalize = torchvision.transforms.Normalize(
+            encoder.default_cfg['mean'], encoder.default_cfg['std'])  # normalize an image that is already scaled to [0, 1]
+        encoder = nn.DataParallel(encoder).to(device)
+        embed = lambda ims: encoder(normalize(ims)).unsqueeze(1)
+    elif model_type.startswith('torch_'):
+        assert num_layers == -1
+        assert not spatial
+
+        model_type = model_type[len('torch_'):]
+        encoder = torch.hub.load('pytorch/vision:v0.6.0', model_type, pretrained=True)
+        encoder.eval()
+        encoder = nn.DataParallel(encoder).to(device)
+        normalize = torchvision.transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # normalize an image that is already scaled to [0, 1]
+        embed = lambda ims: encoder(normalize(ims)).unsqueeze(1)
+    else:
+        raise ValueError
+
+    if checkpoint:
+        return lambda x: run_checkpoint(embed, x)
+
+    return embed
+
+
+def compute_aligned_loss(args, features1, features2, acc_map=None):
+    assert features1.ndim == 4
+    assert features1.shape == features2.shape
+
+    if args.aligned_loss_comparison == 'mse':
+        mse = F.mse_loss(features1, features2, reduction='none')
+        if args.mask_aligned_loss:
+            assert acc_map.shape == features1.shape[2:]  # [H,W]
+            mse = mse * acc_map.unsqueeze(0).unsqueeze(1)
+        return mse.mean()
+
+    if args.aligned_loss_comparison == 'cosine_sim':
+        sim = F.cosine_similarity(features1, features2, dim=1)
+        if args.mask_aligned_loss:
+            assert acc_map.shape == features1.shape[2:]  # [H,W]
+            sim = sim * acc_map.unsqueeze(0)
+        return -sim.mean()
+
+
+def c2w_to_w2c(c2w):
+    assert c2w.shape == (3, 4)
+    c2w_rotation = c2w[:, :3]
+    camera_origin = c2w[:, 3].unsqueeze(1)
+    return torch.cat([c2w_rotation.T, -c2w_rotation.T.mm(camera_origin)], dim=1)
+
+
+def world_to_image(rendered_pts, w2c, H, W, focal, principal_point):
+    """Convert from ray pts in world coordinates to image coordinates
+
+    Args:
+        rendered_pts (tensor): [cnH,cnW,sampled_pts,3] xyz world coordinates along rays
+        w2c (tensor): [3,4] transformation matrix to camera pose
+    Returns:
+        uv (tensor): [cnH,cnW,sampled_pts,2] uv pixel coordinates between 0 and H or W
+        norm_uv (tensor): [cnH,cnW,sampled_pts,2] normalized uv pixel coordinates between -1 and 1
+    """
+    # Transform rendered rays
+    rendered_pts_extended = torch.cat([rendered_pts, torch.ones_like(rendered_pts[..., 0:1])], dim=-1)
+    rendered_pts_camera = torch.einsum('cw,absw->absc', w2c, rendered_pts_extended)
+
+    # Convert to image coordinates
+    uv = -rendered_pts_camera[..., :2] / rendered_pts_camera[..., 2:]  # [H,W,B,2]
+    uv = uv * focal + principal_point
+    uv[..., 1] = H - uv[..., 1]
+    norm_uv = uv / torch.tensor([H,W], device=uv.device) * 2 - 1  # between [-1, 1] for F.grid_sample
+
+    return uv, norm_uv
+
+
+def resample_features(features, norm_uv, weights, feature_interp_mode='bilinear'):
+    """
+    Args:
+        features (tensor): [D, H, W] or [1, D, H, W]
+        norm_uv (tensor): [cnH, cnW, samples_per_ray, 2]
+        weights (tensor): [cnH, cnW, samples_per_ray]
+        feature_interp_mode (str): bilinear or nearest
+    Returns:
+        features (tensor): [1, D, cnH, cnW]
+    """
+    # Resample features along rays
+    features = features.expand(norm_uv.shape[2], -1, -1, -1)  # [samples_per_ray, D, H, W]
+    features = F.grid_sample(
+        features,
+        norm_uv.permute(2, 0, 1, 3).type(features.dtype),  # [samples_per_ray, consistency_nH, consistency_nW, 2]
+        align_corners=True,
+        padding_mode='border',
+        mode=feature_interp_mode,
+    )  # [samples_per_ray, D, consistency_nH, consistency_nW], D is 256 for CLIP RN50 featurize
+
+    # Weighted average of target features along each ray
+    weights = weights.permute(2, 0, 1).unsqueeze(1)
+    features = weights * features
+    features = features.sum(dim=0, keepdim=True)  # [1, D, cnH, cnW]
+
+    return features
+
+
 def config_parser():
 
     import configargparse
@@ -601,14 +732,13 @@ def config_parser():
     parser.add_argument("--consistency_nW", type=int, default=32, 
                         help='number of columns to render for consistency loss')
     parser.add_argument("--consistency_size", type=int, default=224)
-    parser.add_argument("--consistency_interp_mode", type=str, default='bicubic')
     parser.add_argument("--consistency_jitter_rays", action='store_true')
     # Consistency model arguments
     parser.add_argument("--consistency_model_type", type=str, default='clip_vit') # choices=['clip_vit', 'clip_rn50']
     parser.add_argument("--consistency_model_num_layers", type=int, default=-1)
-
-    parser.add_argument("--checkpoint_rendering", action='store_true')
-
+    parser.add_argument("--consistency_reembed_target", action='store_true',
+                        help='reembed target image each iteration that the consistency loss is computed')
+    #
     parser.add_argument("--consistency_poses", type=str, choices=['loaded', 'interpolate_train_all', 'uniform'], default='loaded')
     parser.add_argument("--consistency_poses_translation_jitter_sigma", type=float, default=0.)
     parser.add_argument("--consistency_poses_interpolate_range", type=float, nargs=2, default=[0., 1.])
@@ -617,12 +747,25 @@ def config_parser():
     parser.add_argument("--consistency_phi_range", type=float, nargs=2)
     parser.add_argument("--consistency_radius_range", type=float, nargs=2)
 
-    parser.add_argument("--consistency_reembed_target", action='store_true',
-                        help='reembed target image each iteration that the consistency loss is computed')
+    # Aligned feature consistency arguments
+    parser.add_argument("--aligned_loss", action='store_true')
+    parser.add_argument("--mask_aligned_loss", action='store_true')
+    parser.add_argument("--spatial_model_type", type=str, default='clip_rn50', choices=['clip_vit', 'clip_rn50'])
+    parser.add_argument("--spatial_model_num_layers", type=int, default=-1)
+    parser.add_argument("--aligned_loss_comparison", type=str, default='cosine_sim', choices=['cosine_sim', 'mse'])
+    parser.add_argument("--aligned_loss_lam", type=float, default=0.1,
+                        help="weight for the fine network's aligned semantic consistency loss")
+    parser.add_argument("--aligned_loss_lam0", type=float, default=0.1,
+                        help="weight for the coarse network's aligned semantic consistency loss")
+
+    #
+    parser.add_argument("--checkpoint_rendering", action='store_true')
+    parser.add_argument("--checkpoint_embedding", action='store_true')
     parser.add_argument("--dump_consistency_data", action='store_true')
-
     parser.add_argument("--no_mse", action='store_true')
-
+    parser.add_argument("--pixel_interp_mode", type=str, default='bicubic')
+    parser.add_argument("--feature_interp_mode", type=str, default='bilinear')
+ 
     return parser
 
 
@@ -712,41 +855,14 @@ def train():
         i_train = np.random.choice(i_train, size=args.max_train_views, replace=False)
         print('Subsampled train views:', i_train)
 
+
+
     # Load embedding network for consistency loss
     if args.consistency_loss != 'none':
         print(f'Using auxilliary consistency loss [{args.consistency_loss}], fine weight [{args.consistency_loss_lam}], coarse weight [{args.consistency_loss_lam0}]')
         # Load embedding model
-        if args.consistency_model_type.startswith('clip_'):
-            if args.consistency_model_type == 'clip_rn50':
-                clip_utils.load_rn(num_layers=args.consistency_model_num_layers, jit=False)
-                embed = lambda ims: clip_utils.clip_model_rn(images_or_text=clip_utils.CLIP_NORMALIZE(ims)).unsqueeze(1)
-                assert not clip_utils.clip_model_rn.training
-            elif args.consistency_model_type == 'clip_vit':
-                clip_utils.load_vit(num_layers=args.consistency_model_num_layers)
-                embed = lambda ims: clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims))  # [N,L=50,D]
-                assert not clip_utils.clip_model_vit.training
-        elif args.consistency_model_type.startswith('timm_'):
-            assert args.consistency_model_num_layers == -1
-
-            model_type = args.consistency_model_type[len('timm_'):]
-            encoder = timm.create_model(model_type, pretrained=True, num_classes=0)
-            encoder.eval()
-            normalize = torchvision.transforms.Normalize(
-                encoder.default_cfg['mean'], encoder.default_cfg['std'])  # normalize an image that is already scaled to [0, 1]
-            encoder = nn.DataParallel(encoder).to(device)
-            embed = lambda ims: encoder(normalize(ims)).unsqueeze(1)
-        elif args.consistency_model_type.startswith('torch_'):
-            assert args.consistency_model_num_layers == -1
-
-            model_type = args.consistency_model_type[len('torch_'):]
-            encoder = torch.hub.load('pytorch/vision:v0.6.0', model_type, pretrained=True)
-            encoder.eval()
-            encoder = nn.DataParallel(encoder).to(device)
-            normalize = torchvision.transforms.Normalize(
-                mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # normalize an image that is already scaled to [0, 1]
-            embed = lambda ims: encoder(normalize(ims)).unsqueeze(1)
-        else:
-            raise ValueError
+        embed = get_embed_fn(args.consistency_model_type, args.consistency_model_num_layers, checkpoint=args.checkpoint_embedding)
+        embed_spatial = get_embed_fn(args.spatial_model_type, args.spatial_model_num_layers, spatial=True, checkpoint=args.checkpoint_embedding)
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -782,8 +898,8 @@ def train():
         dummy = torch.ones(1, dtype=torch.float32, requires_grad=True, device=device)
         network_fn_wrapper = lambda x, y: network_fn(x)
         network_fine_wrapper = lambda x, y: network_fine(x)
-        render_kwargs_train['network_fn'] = lambda x: torch.utils.checkpoint.checkpoint(network_fn_wrapper, x, dummy)
-        render_kwargs_train['network_fine'] = lambda x: torch.utils.checkpoint.checkpoint(network_fine_wrapper, x, dummy)
+        render_kwargs_train['network_fn'] = lambda x: run_checkpoint(network_fn_wrapper, x, dummy)
+        render_kwargs_train['network_fine'] = lambda x: run_checkpoint(network_fine_wrapper, x, dummy)
 
 
     bds_dict = {
@@ -869,12 +985,34 @@ def train():
     calc_ctr_loss = args.consistency_loss.startswith('consistent_with_target_rep')
     if calc_ctr_loss:
         with torch.no_grad():
-            targets = images[i_train]
-            targets = targets.permute(0, 3, 1, 2)
+            i_train_map = {it: i for i, it in enumerate(i_train)}  # map from indices into all images to indices in selected training images
+            targets = images[i_train].permute(0, 3, 1, 2)
             if args.consistency_target_augmentation != 'none':
                 raise NotImplementedError
-            targets = torch.nn.functional.interpolate(targets, size=(args.consistency_size, args.consistency_size), mode=args.consistency_interp_mode)
-            target_embeddings = embed(targets)  # [N,L,D]
+            targets_resize_model = F.interpolate(targets, (args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
+            target_embeddings = embed(targets_resize_model)  # [N,L,D]
+
+    # Embed training images for aligned consistency loss
+    if args.aligned_loss:
+        assert calc_ctr_loss
+        assert args.dataset_type != 'llff' or args.no_ndc  # Haven't written working transform code for NDC
+        assert not args.consistency_jitter_rays  # Translating the rays leads to a mismatched alignment
+
+        with torch.no_grad():
+            targets = images[i_train].permute(0, 3, 1, 2)
+
+            # Embed targets
+            target_features = embed_spatial(targets_resize_model)  # [N,C,fH,fW]
+
+            # Resize target features at the full resolution (H,W)
+            targets_features_resize_full = F.interpolate(target_features, (H, W), mode=args.feature_interp_mode)
+
+            principal_point = torch.tensor([[H/2., W/2.]], device=device)
+
+    consistency_keep_keys = ['rgb_map', 'rgb0']
+    if args.aligned_loss or args.dump_consistency_data:
+        consistency_keep_keys = ['rgb_map', 'rgb0', 'pts', 'pts0', 'weights', 'weights0', 'acc_map', 'acc0']
+ 
 
     start = start + 1
     for i in trange(start, N_iters):
@@ -938,61 +1076,124 @@ def train():
                     rays = get_rays(H, W, focal, c2w=pose, nH=args.consistency_nH, nW=args.consistency_nW,
                                     jitter=args.consistency_jitter_rays)
 
-                # rgb0 is the rendering from the coarse network, while rgb uses the fine network
-                keep_keys = ['rgb_map', 'rgb0']
-                if args.dump_consistency_data:
-                    keep_keys = ['rgb_map', 'rgb0', 'pts', 'pts0', 'weights', 'weights0', 'acc_map', 'acc0']
                 extras = render(H, W, focal, chunk=args.chunk, rays=rays,
-                                keep_keys=keep_keys,
+                                keep_keys=consistency_keep_keys,
                                 **render_kwargs_train)[-1]
+                # rgb0 is the rendering from the coarse network, while rgb_map uses the fine network
                 rgbs = torch.stack([extras['rgb_map'], extras['rgb0']], dim=0)
                 rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
 
-                with torch.cuda.amp.autocast():
-                    if i == 0:
-                        print('consistency loss rendered rgb image shape:', rgbs.shape)
+                # with torch.cuda.amp.autocast():
+                if i == 0:
+                    print('consistency loss rendered rgb image shape:', rgbs.shape)
 
-                    # Resize rendered images
-                    target = target.permute(2, 0, 1).unsqueeze(0)
-                    if args.consistency_nH == args.consistency_size and args.consistency_nW == args.consistency_size:
-                        rgbs = rgbs[..., :args.consistency_size, :args.consistency_size]  # found that the rgb.shape[2] can be 225
-                        assert rgbs.shape[2] == args.consistency_size and rgbs.shape[3] == args.consistency_size
-                    else:
-                        rgbs = torch.nn.functional.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.consistency_interp_mode)
+                # Resize and embed rendered images
+                rgbs_resize_c = F.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
+                rendered_embedding, rendered_embedding0 = embed(rgbs_resize_c)
+                assert not args.consistency_reembed_target
 
-                    # Embed rendered images
-                    if args.consistency_reembed_target:
-                        old_target = target
-                        target = torch.nn.functional.interpolate(target, size=(args.consistency_size, args.consistency_size), mode=args.consistency_interp_mode)
-                        stacked = torch.cat([rgbs, target], dim=0)
-                        stacked_embeddings = embed(stacked)
-                        rendered_embedding, rendered_embedding0, target_embedding = stacked_embeddings
+                # Embed rendered images
+                # if args.consistency_reembed_target:
+                #     assert not args.aligned_loss
+                #     target = target.permute(2, 0, 1).unsqueeze(0)
+                #     old_target = target
+                #     target = F.interpolate(target, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
+                #     stacked = torch.cat([rgbs_resize_c, target], dim=0)
+                #     stacked_embeddings = embed(stacked)
+                #     rendered_embedding, rendered_embedding0, target_embedding = stacked_embeddings
 
-                        if args.dump_consistency_data:
-                            spatial_features = clip_utils.clip_model_rn.module.clip_model.visual.featurize(stacked.type(torch.float16))
-                            out_path = os.path.join(basedir, expname, 'consistency_data.pth')
-                            torch.save({
-                                'rays': rays,
-                                'rgb': extras['rgb_map'],
-                                'extras': extras,
-                                'rgbs': rgbs,
-                                'target': target,
-                                'old_target': old_target,
-                                'rendered_pose': pose,
-                                'target_pose': poses[img_i, :3,:4],
-                                'stacked_embeddings': stacked_embeddings,
-                                'spatial_features': spatial_features,
-                                'HWF': (H,W,focal),
-                            }, out_path)
-                            print('Saved c2w poses, rays, renderings and embeddings to', out_path)
-                            sys.exit()
-                    else:
-                        rendered_embedding, rendered_embedding0 = embed(rgbs)
+                #     if args.dump_consistency_data:
+                #         spatial_features = clip_utils.clip_model_rn.module.clip_model.visual.featurize(stacked.type(torch.float16))
+                #         out_path = os.path.join(basedir, expname, 'consistency_data.pth')
+                #         torch.save({
+                #             'rays': rays,
+                #             'rgb': extras['rgb_map'],
+                #             'extras': extras,
+                #             'rgbs': rgbs_resize_c,
+                #             'target': target,
+                #             'old_target': old_target,
+                #             'rendered_pose': pose,
+                #             'target_pose': poses[img_i, :3,:4],
+                #             'stacked_embeddings': stacked_embeddings,
+                #             'spatial_features': spatial_features,
+                #             'HWF': (H,W,focal),
+                #         }, out_path)
+                #         print('Saved c2w poses, rays, renderings and embeddings to', out_path)
+                #         sys.exit()
+                # else:
+                #     rendered_embedding, rendered_embedding0 = embed(rgbs_resize_c)
+
+                if args.aligned_loss:
+                    # TODO: support sampling nearby targets
+                    align_target_i = img_i
+                    align_target_pose = poses[align_target_i, :3,:4]
+
+                    # Create world to target camera trasformation
+                    w2c = c2w_to_w2c(align_target_pose)
+
+                    # Transform rendered rays
+                    _, norm_uv = run_checkpoint(world_to_image, extras['pts'], w2c, H, W, focal, principal_point)
+                    _, norm_uv0 = run_checkpoint(world_to_image, extras['pts0'], w2c, H, W, focal, principal_point)
+
+                    # Embed rendered images into spatial features
+                    rendered_features = embed_spatial(rgbs_resize_c)  # [2, D, fH, fW] = [2, 256, 56, 56] for CLIP RN50
+                    
+                    _resample = functools.partial(resample_features, feature_interp_mode=args.feature_interp_mode)
+                    target_feature_samples = run_checkpoint(_resample,
+                        targets_features_resize_full[i_train_map[align_target_i]],
+                        norm_uv,
+                        extras['weights'],
+                    )
+
+                    target_feature_samples0 = run_checkpoint(_resample,
+                        targets_features_resize_full[i_train_map[align_target_i]],
+                        norm_uv0,
+                        extras['weights0'],
+                    )
+
+                    # Save acc map for loss calculation
+                    rendered_acc_map = extras['acc_map']
+                    rendered_acc0 = extras['acc0']
+
+
+
+                    # rendered_pts = extras['pts']
+                    # rendered_pts_extended = torch.cat([rendered_pts, torch.ones_like(rendered_pts[..., 0:1])], dim=-1)
+                    # rendered_pts_camera = torch.einsum('cw,absw->absc', w2c, rendered_pts_extended)
+
+                    # # Convert to image coordinates
+                    # uv = -rendered_pts_camera[..., :2] / rendered_pts_camera[..., 2:]  # [H,W,B,2]
+                    # uv = uv * focal + principal_point
+                    # uv[..., 1] = H - uv[..., 1]
+                    # norm_uv = uv / torch.tensor([H,W]) * 2 - 1  # between [-1, 1] for F.grid_sample
+
+
+                    # # Resample target features along rendered rays
+                    # target_feature_samples = targets_features_resize_full[i_train_map[align_target_i]].expand(samples_per_ray, -1, -1, -1)
+                    # target_feature_samples = F.grid_sample(
+                    #     target_feature_samples,
+                    #     norm_uv.permute(2, 0, 1, 3).type(target_feature_samples.dtype),  # [samples_per_ray, consistency_nH, consistency_nW, 2]
+                    #     align_corners=True,
+                    #     padding_mode='border',
+                    #     mode=args.feature_interp_mode,
+                    # )  # [samples_per_ray, D, consistency_nH, consistency_nW], D is 256 for CLIP RN50 featurize
+
+                    # # Weighted average of target features along ray
+                    # weights = extras['weights'].permute(2, 0, 1).unsqueeze(1)
+                    # target_feature_samples = weights * target_feature_samples
+                    # target_feature_samples = target_feature_samples.sum(dim=0, keepdim=True)  # [1, D, cnH, cnW]
 
                 if i%args.i_log_ctr_img==0:
-                    metrics['train_ctr/target'] = wandb.Image(target.detach().cpu())
-                    metrics['train_ctr/rgb'] = wandb.Image(rgb.detach().permute(2, 0, 1).cpu())
-                    metrics['train_ctr/rgb0'] = wandb.Image(extras['rgb0'].permute(2, 0, 1).detach().cpu())
+                    metrics['train_ctr/target'] = wandb.Image(target.detach().cpu().numpy())
+                    metrics['train_ctr/rgb'] = wandb.Image(extras['rgb_map'].detach().cpu().numpy())
+                    metrics['train_ctr/rgb0'] = wandb.Image(extras['rgb0'].detach().cpu().numpy())
+
+                    if args.aligned_loss:
+                        metrics['train_aligned/target_feature_samples'] = wandb.Image(target_feature_samples.detach()[0,...,None].mean(1).cpu().numpy())
+                        metrics['train_aligned/rendered_features'] = wandb.Image(rendered_features.detach()[0,...,None].mean(1).cpu().numpy())
+                        metrics['train_aligned/rendered_features0'] = wandb.Image(rendered_features.detach()[1,...,None].mean(1).cpu().numpy())
+                        metrics['train_aligned/acc_map'] = wandb.Image(extras['acc_map'].detach().unsqueeze(-1).cpu().numpy())
+                        metrics['train_aligned/acc0'] = wandb.Image(extras['acc0'].detach().unsqueeze(-1).cpu().numpy())
 
 
         #####  Core optimization loop  #####
@@ -1029,7 +1230,8 @@ def train():
                 if args.consistency_loss == 'consistent_with_target_rep':
                     # NOTE: Randomly sampling a target (run 031) is worse than sampling the same target as MSE (run 032)
                     # target_i = np.random.randint(len(target_embeddings))
-                    target_i = np.where(i_train == img_i)[0][0]  # same target as used for the MSE loss
+                    # target_i = np.where(i_train == img_i)[0][0]  # same target as used for the MSE loss
+                    target_i = i_train_map[img_i]
 
                     assert rendered_embedding.ndim == 2  # [L,D]
                     assert target_embeddings.ndim == 3  # [N,L,D]
@@ -1088,6 +1290,24 @@ def train():
                         consistency_loss = consistency_loss.min()
             loss = (loss + consistency_loss * args.consistency_loss_lam +
                     consistency_loss0 * args.consistency_loss_lam0)
+
+        if args.aligned_loss and ctr_loss_iter:
+            rendered_features_resize_c = F.interpolate(rendered_features, (args.consistency_nH, args.consistency_nW), mode=args.feature_interp_mode)
+            rendered_features_resize_c = rendered_features_resize_c.float()
+
+            # print('aligned_loss', rendered_features.dtype, rendered_features_resize_c.dtype, target_feature_samples.dtype, rendered_acc_map.dtype, rendered_acc0.dtype)
+            aligned_loss = compute_aligned_loss(args,
+                rendered_features_resize_c[0:1],
+                target_feature_samples,  # [1, D, cnH, cnW]
+                rendered_acc_map)
+
+            aligned_loss0 = compute_aligned_loss(args,
+                rendered_features_resize_c[1:2],
+                target_feature_samples0,
+                rendered_acc0)
+
+            loss = (loss + aligned_loss * args.aligned_loss_lam +
+                    aligned_loss0 * args.aligned_loss_lam0)
 
         loss.backward()
         optimizer.step()
@@ -1150,6 +1370,10 @@ def train():
             if calc_ctr_loss and ctr_loss_iter:
                 metrics["train_ctr/consistency_loss"] = consistency_loss.item()
                 metrics["train_ctr/consistency_loss0"] = consistency_loss0.item()
+
+                if args.aligned_loss:
+                    metrics["train_aligned/aligned_loss"] = aligned_loss.item()
+                    metrics["train_aligned/aligned_loss0"] = aligned_loss0.item()
 
         if i%args.i_log_raw_hist==0:
             metrics["train/tran"] = wandb.Histogram(trans.detach().cpu().numpy())
