@@ -1,12 +1,13 @@
 import functools
-import IPython
-
 import os
-import numpy as np
-import imageio
-from scipy.spatial.transform import Rotation
-import sys
 import time
+
+import clip_utils
+import configargparse
+import imageio
+import numpy as np
+from scipy.spatial.transform import Rotation
+import timm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,16 +16,11 @@ import torchvision
 from tqdm import tqdm, trange
 import wandb
 
-from run_nerf_helpers import *
-
+import geometry
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data, pose_spherical_uniform
-
-import clip_utils
-import timm
-
-import geometry
+from run_nerf_helpers import *
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -469,11 +465,11 @@ def get_embed_fn(model_type, num_layers=-1, spatial=False, checkpoint=False):
         if model_type == 'clip_rn50':
             clip_utils.load_rn(jit=False)
             if spatial:
-                _clip_dtype = clip_utils.clip_model_rn.module.clip_model.dtype
+                _clip_dtype = clip_utils.clip_model_rn.clip_model.dtype
                 assert num_layers == -1
                 def embed(ims):
                     ims = clip_utils.CLIP_NORMALIZE(ims).type(_clip_dtype)
-                    return clip_utils.clip_model_rn.module.clip_model.visual.featurize(ims)  # [N,C,56,56]
+                    return clip_utils.clip_model_rn.clip_model.visual.featurize(ims)  # [N,C,56,56]
             else:
                 embed = lambda ims: clip_utils.clip_model_rn(images_or_text=clip_utils.CLIP_NORMALIZE(ims), num_layers=num_layers).unsqueeze(1)
             assert not clip_utils.clip_model_rn.training
@@ -594,6 +590,15 @@ def resample_features(features, norm_uv, weights, feature_interp_mode='bilinear'
     return features
 
 
+def get_patch_similarity_matrix(embs1, embs2):
+    assert embs1.ndim == 2  # [L1,D]
+    assert embs2.ndim == 3  # [L2,D]
+    embs1 = F.normalize(embs1, p=2, dim=-1)  # [L1,D]
+    embs2 = F.normalize(embs2, p=2, dim=-1)  # [B,L2,D]
+    sim = torch.matmul(embs2, embs1.transpose(0,1))  # [B,L2,L1]
+    return sim.view(-1, embs1.shape[0]).transpose(0,1)  # [L1,B*L2]
+
+
 @torch.no_grad()
 def make_wandb_image(tensor):
     tensor = tensor.float()
@@ -603,8 +608,6 @@ def make_wandb_image(tensor):
 
 
 def config_parser():
-
-    import configargparse
     parser = configargparse.ArgumentParser()
     parser.add_argument('--config', is_config_file=True, 
                         help='config file path')
@@ -722,7 +725,7 @@ def config_parser():
     parser.add_argument("--save_splits", action="store_true",
                         help='save ground truth images and poses in each split')
 
-    ## options for learning with few views
+    ### options for learning with few views
     parser.add_argument("--max_train_views", type=int, default=-1,
                         help='limit number of training views for the mse loss')
     # Options for rendering shared between different losses
@@ -743,10 +746,15 @@ def config_parser():
     parser.add_argument("--render_nW", "--consistency_nW", type=int, default=32, 
                         help='number of columns to render for consistency loss')
     parser.add_argument("--render_jitter_rays", "--consistency_jitter_rays", action='store_true')
+    # Computational options shared between rendering losses
+    parser.add_argument("--checkpoint_rendering", action='store_true')
+    parser.add_argument("--checkpoint_embedding", action='store_true')
+    parser.add_argument("--no_mse", action='store_true')
+    parser.add_argument("--pixel_interp_mode", type=str, default='bicubic')
+    parser.add_argument("--feature_interp_mode", type=str, default='bilinear')
 
     # Global semantic consistency loss
-    parser.add_argument("--consistency_loss", type=str, default='none', choices=[
-        'none', 'consistent_with_target_rep', 'consistent_with_target_reps_mean', 'consistent_with_target_reps_min'])
+    parser.add_argument("--consistency_loss", type=str, default='none', choices=['none', 'consistent_with_target_rep'])
     parser.add_argument("--consistency_loss_comparison", type=str, default=['cosine_sim'], nargs='+', choices=[
         'cosine_sim', 'mse', 'max_patch_match_sametarget', 'max_patch_match_alltargets'])
     parser.add_argument("--consistency_loss_lam", type=float, default=0.2,
@@ -759,8 +767,6 @@ def config_parser():
     # Consistency model arguments
     parser.add_argument("--consistency_model_type", type=str, default='clip_vit') # choices=['clip_vit', 'clip_rn50']
     parser.add_argument("--consistency_model_num_layers", type=int, default=-1)
-    parser.add_argument("--consistency_reembed_target", action='store_true',
-                        help='reembed target image each iteration that the consistency loss is computed')
 
     # Aligned feature consistency arguments
     parser.add_argument("--aligned_loss", action='store_true')
@@ -776,14 +782,6 @@ def config_parser():
     # Discriminator losses
     parser.add_argument("--adversarial_loss", action='store_true')
 
-    #
-    parser.add_argument("--checkpoint_rendering", action='store_true')
-    parser.add_argument("--checkpoint_embedding", action='store_true')
-    parser.add_argument("--dump_consistency_data", action='store_true')
-    parser.add_argument("--no_mse", action='store_true')
-    parser.add_argument("--pixel_interp_mode", type=str, default='bicubic')
-    parser.add_argument("--feature_interp_mode", type=str, default='bilinear')
- 
     return parser
 
 
@@ -873,13 +871,11 @@ def train():
         i_train = np.random.choice(i_train, size=args.max_train_views, replace=False)
         print('Subsampled train views:', i_train)
 
-
-
-    # Load embedding network for consistency loss
+    # Load embedding network for rendering losses
     if args.consistency_loss != 'none':
         print(f'Using auxilliary consistency loss [{args.consistency_loss}], fine weight [{args.consistency_loss_lam}], coarse weight [{args.consistency_loss_lam0}]')
-        # Load embedding model
         embed = get_embed_fn(args.consistency_model_type, args.consistency_model_num_layers, checkpoint=args.checkpoint_embedding)
+    if args.aligned_loss:
         embed_spatial = get_embed_fn(args.spatial_model_type, args.spatial_model_num_layers, spatial=True, checkpoint=args.checkpoint_embedding)
 
     # Cast intrinsics to right types
@@ -1028,7 +1024,7 @@ def train():
             principal_point = torch.tensor([[H/2., W/2.]], device=device)
 
     consistency_keep_keys = ['rgb_map', 'rgb0']
-    if args.aligned_loss or args.dump_consistency_data:
+    if args.aligned_loss:
         consistency_keep_keys = ['rgb_map', 'rgb0', 'pts', 'pts0', 'weights', 'weights0', 'acc_map', 'acc0']
  
 
@@ -1108,10 +1104,6 @@ def train():
                     # Resize and embed rendered images
                     rgbs_resize_c = F.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
                     rendered_embedding, rendered_embedding0 = embed(rgbs_resize_c)
-
-                    # NOTE: removed this code
-                    assert not args.consistency_reembed_target
-                    assert not args.dump_consistency_data
 
                 if args.aligned_loss:
                     # TODO: support sampling nearby targets
@@ -1194,75 +1186,49 @@ def train():
             loss = 0
 
         if calc_ctr_loss and render_loss_iter:
-            if args.consistency_reembed_target:
-                assert args.consistency_loss == 'consistent_with_target_rep'
-                assert args.consistency_loss_comparison == ('cosine_sim',)
-                consistency_loss = -torch.cosine_similarity(
-                    target_embedding, rendered_embedding, dim=-1).mean()
-                consistency_loss0 = -torch.cosine_similarity(
-                    target_embedding, rendered_embedding0, dim=-1).mean()
-            else:
-                if args.consistency_loss == 'consistent_with_target_rep':
-                    # NOTE: Randomly sampling a target (run 031) is worse than sampling the same target as MSE (run 032)
-                    # target_i = np.random.randint(len(target_embeddings))
-                    # target_i = np.where(i_train == img_i)[0][0]  # same target as used for the MSE loss
-                    target_i = i_train_map[img_i]
+            if args.consistency_loss == 'consistent_with_target_rep':
+                # NOTE: Randomly sampling a target (run 031) is worse than sampling the same target as MSE (run 032)
+                target_i = i_train_map[img_i]
 
-                    assert rendered_embedding.ndim == 2  # [L,D]
-                    assert target_embeddings.ndim == 3  # [N,L,D]
+                assert rendered_embedding.ndim == 2  # [L,D]
+                assert target_embeddings.ndim == 3  # [N,L,D]
 
-                    target_emb = target_embeddings[target_i, 0]
-                    rendered_emb = rendered_embedding[0]
-                    rendered_emb0 = rendered_embedding0[0]
+                target_emb = target_embeddings[target_i, 0]
+                rendered_emb = rendered_embedding[0]
+                rendered_emb0 = rendered_embedding0[0]
 
-                    consistency_loss, consistency_loss0 = [], []
-                    if 'cosine_sim' in args.consistency_loss_comparison:
-                        consistency_loss.append(-torch.cosine_similarity(target_emb, rendered_emb, dim=-1))
-                        consistency_loss0.append(-torch.cosine_similarity(target_emb, rendered_emb0, dim=-1))
+                consistency_loss, consistency_loss0 = [], []
+                if 'cosine_sim' in args.consistency_loss_comparison:
+                    consistency_loss.append(-torch.cosine_similarity(target_emb, rendered_emb, dim=-1))
+                    consistency_loss0.append(-torch.cosine_similarity(target_emb, rendered_emb0, dim=-1))
 
-                    if 'mse' in args.consistency_loss_comparison:
-                        consistency_loss.append(F.mse_loss(rendered_emb, target_emb))
-                        consistency_loss0.append(F.mse_loss(rendered_emb0, target_emb))
+                if 'mse' in args.consistency_loss_comparison:
+                    consistency_loss.append(F.mse_loss(rendered_emb, target_emb))
+                    consistency_loss0.append(F.mse_loss(rendered_emb0, target_emb))
 
-                    def get_patch_similarity_matrix(embs1, embs2):
-                        assert embs1.ndim == 2  # [L1,D]
-                        assert embs2.ndim == 3  # [L2,D]
-                        embs1 = F.normalize(embs1, p=2, dim=-1)  # [L1,D]
-                        embs2 = F.normalize(embs2, p=2, dim=-1)  # [B,L2,D]
-                        sim = torch.matmul(embs2, embs1.transpose(0,1))  # [B,L2,L1]
-                        return sim.view(-1, embs1.shape[0]).transpose(0,1)  # [L1,B*L2]
+                if 'max_patch_match_alltargets' in args.consistency_loss_comparison:
+                    patch_sim = get_patch_similarity_matrix(rendered_embedding[1:], target_embeddings[:, 1:])  # [L-1,num_targ*(L-1)]
+                    max_patch_sim, _ = torch.max(patch_sim, dim=1)  # max across target patches
+                    consistency_loss.append(-torch.mean(max_patch_sim))  # mean across rendered patches
 
-                    if 'max_patch_match_alltargets' in args.consistency_loss_comparison:
-                        patch_sim = get_patch_similarity_matrix(rendered_embedding[1:], target_embeddings[:, 1:])  # [L-1,num_targ*(L-1)]
-                        max_patch_sim, _ = torch.max(patch_sim, dim=1)  # max across target patches
-                        consistency_loss.append(-torch.mean(max_patch_sim))  # mean across rendered patches
+                    patch_sim0 = get_patch_similarity_matrix(rendered_embedding0[1:], target_embeddings[:, 1:])
+                    max_patch_sim0, _ = torch.max(patch_sim0, dim=1)
+                    consistency_loss0.append(-torch.mean(max_patch_sim0))
 
-                        patch_sim0 = get_patch_similarity_matrix(rendered_embedding0[1:], target_embeddings[:, 1:])
-                        max_patch_sim0, _ = torch.max(patch_sim0, dim=1)
-                        consistency_loss0.append(-torch.mean(max_patch_sim0))
+                if 'max_patch_match_sametarget' in args.consistency_loss_comparison:
+                    patch_sim = get_patch_similarity_matrix(
+                        rendered_embedding[1:], target_embeddings[target_i, 1:].unsqueeze(0))  # [L-1,L-1]
+                    max_patch_sim, _ = torch.max(patch_sim, dim=1)  # max across target patches
+                    consistency_loss.append(-torch.mean(max_patch_sim))  # mean across rendered patches
 
-                    if 'max_patch_match_sametarget' in args.consistency_loss_comparison:
-                        patch_sim = get_patch_similarity_matrix(
-                            rendered_embedding[1:], target_embeddings[target_i, 1:].unsqueeze(0))  # [L-1,L-1]
-                        max_patch_sim, _ = torch.max(patch_sim, dim=1)  # max across target patches
-                        consistency_loss.append(-torch.mean(max_patch_sim))  # mean across rendered patches
+                    patch_sim0 = get_patch_similarity_matrix(
+                        rendered_embedding0[1:], target_embeddings[target_i, 1:].unsqueeze(0))  # [L-1,L-1]
+                    max_patch_sim0, _ = torch.max(patch_sim0, dim=1)
+                    consistency_loss0.append(-torch.mean(max_patch_sim0))
 
-                        patch_sim0 = get_patch_similarity_matrix(
-                            rendered_embedding0[1:], target_embeddings[target_i, 1:].unsqueeze(0))  # [L-1,L-1]
-                        max_patch_sim0, _ = torch.max(patch_sim0, dim=1)
-                        consistency_loss0.append(-torch.mean(max_patch_sim0))
+                consistency_loss = torch.mean(torch.stack(consistency_loss))
+                consistency_loss0 = torch.mean(torch.stack(consistency_loss0))
 
-                    consistency_loss = torch.mean(torch.stack(consistency_loss))
-                    consistency_loss0 = torch.mean(torch.stack(consistency_loss0))
-                elif args.consistency_loss.startswith('consistent_with_target_reps'):
-                    raise NotImplementedError  # DEBUG: temporary, need to add consistency_loss0
-
-                    consistency_loss = -torch.cosine_similarity(
-                        target_embeddings, rendered_embedding, dim=-1)  # [len(target_embeddings),]
-                    if args.consistency_loss.endswith('_mean'):
-                        consistency_loss = consistency_loss.mean()
-                    elif args.consistency_loss.endswith('_min'):
-                        consistency_loss = consistency_loss.min()
             loss = (loss + consistency_loss * args.consistency_loss_lam +
                     consistency_loss0 * args.consistency_loss_lam0)
 
