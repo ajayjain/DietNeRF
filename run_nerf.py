@@ -706,7 +706,8 @@ def config_parser():
                         help='frequency of metric logging')
     parser.add_argument("--i_log_raw_hist",   type=int, default=2, 
                         help='frequency of logging histogram of raw network outputs')
-    parser.add_argument("--i_log_ctr_img",   type=int, default=100, 
+    parser.add_argument("--i_log_rendered_img", "--i_log_ctr_img",
+                        type=int, default=100, 
                         help='frequency of train rendering logging')
     parser.add_argument("--i_print",   type=int, default=100, 
                         help='frequency of console printout')
@@ -724,7 +725,26 @@ def config_parser():
     ## options for learning with few views
     parser.add_argument("--max_train_views", type=int, default=-1,
                         help='limit number of training views for the mse loss')
+    # Options for rendering shared between different losses
+    parser.add_argument("--render_loss_interval", "--consistency_loss_interval",
+        type=float, default=1)
+    parser.add_argument("--render_poses", "--consistency_poses",
+        type=str, choices=['loaded', 'interpolate_train_all', 'uniform'], default='loaded')
+    parser.add_argument("--render_poses_translation_jitter_sigma", "--consistency_poses_translation_jitter_sigma",
+        type=float, default=0.)
+    parser.add_argument("--render_poses_interpolate_range", "--consistency_poses_interpolate_range",
+        type=float, nargs=2, default=[0., 1.])
+    # Options for --render_poses=uniform
+    parser.add_argument("--render_theta_range", "--consistency_theta_range", type=float, nargs=2)
+    parser.add_argument("--render_phi_range", "--consistency_phi_range", type=float, nargs=2)
+    parser.add_argument("--render_radius_range", "--consistency_radius_range", type=float, nargs=2)
+    parser.add_argument("--render_nH", "--consistency_nH", type=int, default=32, 
+                        help='number of rows to render for consistency loss. smaller values use less memory')
+    parser.add_argument("--render_nW", "--consistency_nW", type=int, default=32, 
+                        help='number of columns to render for consistency loss')
+    parser.add_argument("--render_jitter_rays", "--consistency_jitter_rays", action='store_true')
 
+    # Global semantic consistency loss
     parser.add_argument("--consistency_loss", type=str, default='none', choices=[
         'none', 'consistent_with_target_rep', 'consistent_with_target_reps_mean', 'consistent_with_target_reps_min'])
     parser.add_argument("--consistency_loss_comparison", type=str, default=['cosine_sim'], nargs='+', choices=[
@@ -733,28 +753,14 @@ def config_parser():
                         help="weight for the fine network's semantic consistency loss")
     parser.add_argument("--consistency_loss_lam0", type=float, default=0.2,
                         help="weight for the coarse network's semantic consistency loss")
-    parser.add_argument("--consistency_loss_interval", type=float, default=1)
     parser.add_argument("--consistency_target_augmentation", type=str, default='none', choices=[
         'none', 'flips', 'tencrop'])
-    parser.add_argument("--consistency_nH", type=int, default=32, 
-                        help='number of rows to render for consistency loss. smaller values use less memory')
-    parser.add_argument("--consistency_nW", type=int, default=32, 
-                        help='number of columns to render for consistency loss')
     parser.add_argument("--consistency_size", type=int, default=224)
-    parser.add_argument("--consistency_jitter_rays", action='store_true')
     # Consistency model arguments
     parser.add_argument("--consistency_model_type", type=str, default='clip_vit') # choices=['clip_vit', 'clip_rn50']
     parser.add_argument("--consistency_model_num_layers", type=int, default=-1)
     parser.add_argument("--consistency_reembed_target", action='store_true',
                         help='reembed target image each iteration that the consistency loss is computed')
-    #
-    parser.add_argument("--consistency_poses", type=str, choices=['loaded', 'interpolate_train_all', 'uniform'], default='loaded')
-    parser.add_argument("--consistency_poses_translation_jitter_sigma", type=float, default=0.)
-    parser.add_argument("--consistency_poses_interpolate_range", type=float, nargs=2, default=[0., 1.])
-    # Options for --consistency_poses=uniform
-    parser.add_argument("--consistency_theta_range", type=float, nargs=2)
-    parser.add_argument("--consistency_phi_range", type=float, nargs=2)
-    parser.add_argument("--consistency_radius_range", type=float, nargs=2)
 
     # Aligned feature consistency arguments
     parser.add_argument("--aligned_loss", action='store_true')
@@ -766,6 +772,9 @@ def config_parser():
                         help="weight for the fine network's aligned semantic consistency loss")
     parser.add_argument("--aligned_loss_lam0", type=float, default=0.1,
                         help="weight for the coarse network's aligned semantic consistency loss")
+
+    # Discriminator losses
+    parser.add_argument("--adversarial_loss", action='store_true')
 
     #
     parser.add_argument("--checkpoint_rendering", action='store_true')
@@ -1005,7 +1014,7 @@ def train():
     if args.aligned_loss:
         assert calc_ctr_loss
         assert args.dataset_type != 'llff' or args.no_ndc  # Haven't written working transform code for NDC
-        assert not args.consistency_jitter_rays  # Translating the rays leads to a mismatched alignment
+        assert not args.render_jitter_rays  # Translating the rays leads to a mismatched alignment
 
         with torch.no_grad():
             targets = images[i_train].permute(0, 3, 1, 2)
@@ -1058,32 +1067,32 @@ def train():
             target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
             # Representational consistency loss with rendered image
-            ctr_loss_iter = i % args.consistency_loss_interval == 0
-            if calc_ctr_loss and ctr_loss_iter:
+            render_loss_iter = i % args.render_loss_interval == 0
+            if (calc_ctr_loss or args.aligned_loss or args.adversarial_loss) and render_loss_iter:
                 with torch.no_grad():
                     # Render from a random viewpoint
-                    if args.consistency_poses == 'loaded':
+                    if args.render_poses == 'loaded':
                         poses_i = np.random.choice(i_train_poses)
                         pose = poses[poses_i, :3, :4]
-                    elif args.consistency_poses == 'interpolate_train_all':
+                    elif args.render_poses == 'interpolate_train_all':
                         assert len(i_train_poses) >= 3
                         poses_i = np.random.choice(i_train_poses, size=3, replace=False)
                         pose1, pose2, pose3 = poses[poses_i, :3, :4].cpu()
-                        s12, s3 = np.random.uniform(*args.consistency_poses_interpolate_range, size=2)
+                        s12, s3 = np.random.uniform(*args.render_poses_interpolate_range, size=2)
                         pose = geometry.interp3(pose1, pose2, pose3, s12, s3)
-                    elif args.consistency_poses == 'uniform':
+                    elif args.render_poses == 'uniform':
                         assert args.dataset_type == 'blender'
-                        pose = pose_spherical_uniform(args.consistency_theta_range, args.consistency_phi_range, args.consistency_radius_range)
+                        pose = pose_spherical_uniform(args.render_theta_range, args.render_phi_range, args.render_radius_range)
                         pose = pose[:3, :4]
 
                     print('Sampled pose:', Rotation.from_matrix(pose[:, :3].cpu()).as_rotvec(), 'origin:', pose[:, 3])
 
-                    if args.consistency_poses_translation_jitter_sigma > 0:
-                        pose[:, -1] = pose[:, -1] + torch.randn(3, device=pose.device) * args.consistency_poses_translation_jitter_sigma
+                    if args.render_poses_translation_jitter_sigma > 0:
+                        pose[:, -1] = pose[:, -1] + torch.randn(3, device=pose.device) * args.render_poses_translation_jitter_sigma
 
                     # TODO: something strange with pts_W in get_rays when 224 nH
-                    rays = get_rays(H, W, focal, c2w=pose, nH=args.consistency_nH, nW=args.consistency_nW,
-                                    jitter=args.consistency_jitter_rays)
+                    rays = get_rays(H, W, focal, c2w=pose, nH=args.render_nH, nW=args.render_nW,
+                                    jitter=args.render_jitter_rays)
 
                 extras = render(H, W, focal, chunk=args.chunk, rays=rays,
                                 keep_keys=consistency_keep_keys,
@@ -1092,45 +1101,17 @@ def train():
                 rgbs = torch.stack([extras['rgb_map'], extras['rgb0']], dim=0)
                 rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
 
-                # with torch.cuda.amp.autocast():
                 if i == 0:
-                    print('consistency loss rendered rgb image shape:', rgbs.shape)
+                    print('rendering losses rendered rgb image shape:', rgbs.shape)
 
-                # Resize and embed rendered images
-                rgbs_resize_c = F.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
-                rendered_embedding, rendered_embedding0 = embed(rgbs_resize_c)
-                assert not args.consistency_reembed_target
+                if calc_ctr_loss:
+                    # Resize and embed rendered images
+                    rgbs_resize_c = F.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
+                    rendered_embedding, rendered_embedding0 = embed(rgbs_resize_c)
 
-                # Embed rendered images
-                # if args.consistency_reembed_target:
-                #     assert not args.aligned_loss
-                #     target = target.permute(2, 0, 1).unsqueeze(0)
-                #     old_target = target
-                #     target = F.interpolate(target, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
-                #     stacked = torch.cat([rgbs_resize_c, target], dim=0)
-                #     stacked_embeddings = embed(stacked)
-                #     rendered_embedding, rendered_embedding0, target_embedding = stacked_embeddings
-
-                #     if args.dump_consistency_data:
-                #         spatial_features = clip_utils.clip_model_rn.module.clip_model.visual.featurize(stacked.type(torch.float16))
-                #         out_path = os.path.join(basedir, expname, 'consistency_data.pth')
-                #         torch.save({
-                #             'rays': rays,
-                #             'rgb': extras['rgb_map'],
-                #             'extras': extras,
-                #             'rgbs': rgbs_resize_c,
-                #             'target': target,
-                #             'old_target': old_target,
-                #             'rendered_pose': pose,
-                #             'target_pose': poses[img_i, :3,:4],
-                #             'stacked_embeddings': stacked_embeddings,
-                #             'spatial_features': spatial_features,
-                #             'HWF': (H,W,focal),
-                #         }, out_path)
-                #         print('Saved c2w poses, rays, renderings and embeddings to', out_path)
-                #         sys.exit()
-                # else:
-                #     rendered_embedding, rendered_embedding0 = embed(rgbs_resize_c)
+                    # NOTE: removed this code
+                    assert not args.consistency_reembed_target
+                    assert not args.dump_consistency_data
 
                 if args.aligned_loss:
                     # TODO: support sampling nearby targets
@@ -1164,7 +1145,10 @@ def train():
                     rendered_acc_map = extras['acc_map']
                     rendered_acc0 = extras['acc0']
 
-                if i%args.i_log_ctr_img==0:
+                if args.adversarial_loss:
+                    raise NotImplementedError
+
+                if i%args.i_log_rendered_img==0:
                     metrics['train_ctr/target'] = wandb.Image(target.detach().cpu().numpy())
                     metrics['train_ctr/rgb'] = wandb.Image(extras['rgb_map'].detach().cpu().numpy())
                     metrics['train_ctr/rgb0'] = wandb.Image(extras['rgb0'].detach().cpu().numpy())
@@ -1209,8 +1193,7 @@ def train():
         if args.no_mse:
             loss = 0
 
-        consistency_loss = None
-        if calc_ctr_loss and ctr_loss_iter:
+        if calc_ctr_loss and render_loss_iter:
             if args.consistency_reembed_target:
                 assert args.consistency_loss == 'consistent_with_target_rep'
                 assert args.consistency_loss_comparison == ('cosine_sim',)
@@ -1283,8 +1266,8 @@ def train():
             loss = (loss + consistency_loss * args.consistency_loss_lam +
                     consistency_loss0 * args.consistency_loss_lam0)
 
-        if args.aligned_loss and ctr_loss_iter:
-            rendered_features_resize_c = F.interpolate(rendered_features, (args.consistency_nH, args.consistency_nW), mode=args.feature_interp_mode)
+        if args.aligned_loss and render_loss_iter:
+            rendered_features_resize_c = F.interpolate(rendered_features, (args.render_nH, args.render_nW), mode=args.feature_interp_mode)
             rendered_features_resize_c = rendered_features_resize_c.float()
 
             # print('aligned_loss', rendered_features.dtype, rendered_features_resize_c.dtype, target_feature_samples.dtype, rendered_acc_map.dtype, rendered_acc0.dtype)
@@ -1359,13 +1342,12 @@ def train():
            })
             if args.N_importance > 0:
                 metrics["train/psnr0"] = psnr0.item()
-            if calc_ctr_loss and ctr_loss_iter:
+            if calc_ctr_loss and render_loss_iter:
                 metrics["train_ctr/consistency_loss"] = consistency_loss.item()
                 metrics["train_ctr/consistency_loss0"] = consistency_loss0.item()
-
-                if args.aligned_loss:
-                    metrics["train_aligned/aligned_loss"] = aligned_loss.item()
-                    metrics["train_aligned/aligned_loss0"] = aligned_loss0.item()
+            if args.aligned_loss and render_loss_iter:
+                metrics["train_aligned/aligned_loss"] = aligned_loss.item()
+                metrics["train_aligned/aligned_loss0"] = aligned_loss0.item()
 
         if i%args.i_log_raw_hist==0:
             metrics["train/tran"] = wandb.Histogram(trans.detach().cpu().numpy())
