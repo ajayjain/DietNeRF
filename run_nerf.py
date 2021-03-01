@@ -593,6 +593,14 @@ def resample_features(features, norm_uv, weights, feature_interp_mode='bilinear'
     return features
 
 
+@torch.no_grad()
+def make_wandb_image(tensor):
+    tensor = tensor.float()
+    mi = tensor.min()
+    tensor = ((tensor - mi) / (tensor.max() - mi))
+    return wandb.Image(tensor.detach().cpu().numpy())
+
+
 def config_parser():
 
     import configargparse
@@ -1155,46 +1163,25 @@ def train():
                     rendered_acc_map = extras['acc_map']
                     rendered_acc0 = extras['acc0']
 
-
-
-                    # rendered_pts = extras['pts']
-                    # rendered_pts_extended = torch.cat([rendered_pts, torch.ones_like(rendered_pts[..., 0:1])], dim=-1)
-                    # rendered_pts_camera = torch.einsum('cw,absw->absc', w2c, rendered_pts_extended)
-
-                    # # Convert to image coordinates
-                    # uv = -rendered_pts_camera[..., :2] / rendered_pts_camera[..., 2:]  # [H,W,B,2]
-                    # uv = uv * focal + principal_point
-                    # uv[..., 1] = H - uv[..., 1]
-                    # norm_uv = uv / torch.tensor([H,W]) * 2 - 1  # between [-1, 1] for F.grid_sample
-
-
-                    # # Resample target features along rendered rays
-                    # target_feature_samples = targets_features_resize_full[i_train_map[align_target_i]].expand(samples_per_ray, -1, -1, -1)
-                    # target_feature_samples = F.grid_sample(
-                    #     target_feature_samples,
-                    #     norm_uv.permute(2, 0, 1, 3).type(target_feature_samples.dtype),  # [samples_per_ray, consistency_nH, consistency_nW, 2]
-                    #     align_corners=True,
-                    #     padding_mode='border',
-                    #     mode=args.feature_interp_mode,
-                    # )  # [samples_per_ray, D, consistency_nH, consistency_nW], D is 256 for CLIP RN50 featurize
-
-                    # # Weighted average of target features along ray
-                    # weights = extras['weights'].permute(2, 0, 1).unsqueeze(1)
-                    # target_feature_samples = weights * target_feature_samples
-                    # target_feature_samples = target_feature_samples.sum(dim=0, keepdim=True)  # [1, D, cnH, cnW]
-
                 if i%args.i_log_ctr_img==0:
                     metrics['train_ctr/target'] = wandb.Image(target.detach().cpu().numpy())
                     metrics['train_ctr/rgb'] = wandb.Image(extras['rgb_map'].detach().cpu().numpy())
                     metrics['train_ctr/rgb0'] = wandb.Image(extras['rgb0'].detach().cpu().numpy())
 
                     if args.aligned_loss:
-                        metrics['train_aligned/target_feature_samples'] = wandb.Image(target_feature_samples.detach()[0,...,None].mean(1).cpu().numpy())
-                        metrics['train_aligned/rendered_features'] = wandb.Image(rendered_features.detach()[0,...,None].mean(1).cpu().numpy())
-                        metrics['train_aligned/rendered_features0'] = wandb.Image(rendered_features.detach()[1,...,None].mean(1).cpu().numpy())
-                        metrics['train_aligned/acc_map'] = wandb.Image(extras['acc_map'].detach().unsqueeze(-1).cpu().numpy())
-                        metrics['train_aligned/acc0'] = wandb.Image(extras['acc0'].detach().unsqueeze(-1).cpu().numpy())
+                        with torch.no_grad():
+                            print('target_feature_samples', target_feature_samples.shape, target_feature_samples.min(), target_feature_samples.max(), target_feature_samples.dtype)
+                            print('rendered_features', rendered_features.shape, rendered_features.min(), rendered_features.max(), rendered_features.dtype)
+                            print('rendered_features[0]', rendered_features[0].shape, rendered_features[0].min(), rendered_features[0].max(), rendered_features[0].dtype)
+                            print('rendered_features[1]', rendered_features[1].shape, rendered_features[1].min(), rendered_features[1].max(), rendered_features[1].dtype)
+                            print('acc_map', rendered_acc_map.shape, rendered_acc_map.min(), rendered_acc_map.max(), rendered_acc_map.dtype)
+                            print('acc0', rendered_acc0.shape, rendered_acc0.min(), rendered_acc0.max(), rendered_acc0.dtype)
 
+                        metrics['train_aligned/target_feature_samples'] = make_wandb_image(target_feature_samples[0,...,None].mean(0))
+                        metrics['train_aligned/rendered_features'] = make_wandb_image(rendered_features[0,...,None].mean(0))
+                        metrics['train_aligned/rendered_features0'] = make_wandb_image(rendered_features[1,...,None].mean(0))
+                        metrics['train_aligned/acc_map'] = make_wandb_image(rendered_acc_map.unsqueeze(-1))
+                        metrics['train_aligned/acc0'] = make_wandb_image(rendered_acc0.unsqueeze(-1))
 
         #####  Core optimization loop  #####
         rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, rays=batch_rays,
@@ -1392,7 +1379,9 @@ def train():
             metrics = {
                 'val/rgb': wandb.Image(to8b(rgb.cpu().numpy())[np.newaxis]),
                 'val/disp': wandb.Image(disp.cpu().numpy()[np.newaxis,...,np.newaxis]),
+                'val/disp_scaled': make_wandb_image(disp[np.newaxis,...,np.newaxis]),
                 'val/acc': wandb.Image(acc.cpu().numpy()[np.newaxis,...,np.newaxis]),
+                'val/acc_scaled': make_wandb_image(acc[np.newaxis,...,np.newaxis]),
                 'val/psnr_holdout': psnr.item(),
                 'val/rgb_holdout': wandb.Image(target.cpu().numpy()[np.newaxis])
             }
