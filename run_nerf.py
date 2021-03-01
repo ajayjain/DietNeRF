@@ -467,23 +467,24 @@ def sample_rays(H, W, rays_o, rays_d, N_rand, i, start, precrop_iters, precrop_f
 def get_embed_fn(model_type, num_layers=-1, spatial=False, checkpoint=False):
     if model_type.startswith('clip_'):
         if model_type == 'clip_rn50':
-            clip_utils.load_rn(num_layers=num_layers, jit=False)
+            clip_utils.load_rn(jit=False)
             if spatial:
                 _clip_dtype = clip_utils.clip_model_rn.module.clip_model.dtype
+                assert num_layers == -1
                 def embed(ims):
                     ims = clip_utils.CLIP_NORMALIZE(ims).type(_clip_dtype)
                     return clip_utils.clip_model_rn.module.clip_model.visual.featurize(ims)  # [N,C,56,56]
             else:
-                embed = lambda ims: clip_utils.clip_model_rn(images_or_text=clip_utils.CLIP_NORMALIZE(ims)).unsqueeze(1)
+                embed = lambda ims: clip_utils.clip_model_rn(images_or_text=clip_utils.CLIP_NORMALIZE(ims), num_layers=num_layers).unsqueeze(1)
             assert not clip_utils.clip_model_rn.training
         elif model_type == 'clip_vit':
-            clip_utils.load_vit(num_layers=num_layers)
+            clip_utils.load_vit()
             if spatial:
                 def embed(ims):
-                    emb = clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims))  # [N,L=50,D]
-                    return emb[:, 1:].view(emb.shape[0], 7, 7, emb.shape[2])  # [N,7,7,D]
+                    emb = clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims), num_layers=num_layers)  # [N,L=50,D]
+                    return emb[:, 1:].view(emb.shape[0], 7, 7, emb.shape[2]).permute(0, 3, 1, 2)  # [N,D,7,7]
             else:
-                embed = lambda ims: clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims))  # [N,L=50,D]
+                embed = lambda ims: clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims), num_layers=num_layers)  # [N,L=50,D]
             assert not clip_utils.clip_model_vit.training
     elif model_type.startswith('timm_'):
         assert num_layers == -1

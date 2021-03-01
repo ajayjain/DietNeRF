@@ -1,0 +1,67 @@
+# Copy of 064 (additional spatial feature alignment loss), but
+#   - uses CLIP ViT for both consistency and alignment losses
+#   - use only up to the 5th layer of the ViT for the alignment loss to save memory
+#   - quarter the chunk size to save memory
+#   - checkpoint embedding to save memory
+expname = 065_blender_lego_ctr-clipvit_alignment-clipvit5-nomask-cosine_sim
+basedir = ./logs
+datadir = ./data/nerf_synthetic/lego
+dataset_type = blender
+
+no_batching = True
+
+use_viewdirs = True
+white_bkgd = True
+lrate_decay = 500
+
+N_samples = 64
+N_importance = 128
+N_rand = 1024
+# chunk = 8192
+chunk = 32768
+
+precrop_iters = 500
+precrop_frac = 0.5
+
+half_res = True
+
+# Consistency related logging, data, and compute args
+max_train_views = 8
+checkpoint_rendering = True
+checkpoint_embedding = True
+i_log_raw_hist = 2
+i_log_ctr_img = 10
+i_video = 6250
+
+# Shared args for consistency and alignment losses
+pixel_interp_mode = bicubic
+feature_interp_mode = bilinear
+consistency_loss_interval = 10
+consistency_nH = 168
+consistency_nW = 168
+consistency_jitter_rays = False
+consistency_size = 224
+
+# Consistency loss
+consistency_loss = consistent_with_target_rep
+consistency_loss_lam = 0.1
+consistency_loss_lam0 = 0.1
+consistency_model_type = clip_vit
+consistency_model_num_layers = -1
+consistency_loss_comparison = cosine_sim
+consistency_reembed_target = False
+
+# Alignment loss
+aligned_loss = True
+mask_aligned_loss = False
+spatial_model_type = clip_vit  # produces BxDx7x7 feature maps
+spatial_model_num_layers = 5
+aligned_loss_comparison = cosine_sim
+aligned_loss_lam = 0.08
+aligned_loss_lam0 = 0.08
+
+# Pose sampling
+consistency_poses = uniform
+consistency_theta_range = [-180, 180]
+consistency_phi_range = [-90, 0]
+consistency_radius_range = [3.5, 4.5]
