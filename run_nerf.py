@@ -1170,6 +1170,8 @@ def train():
 
                     if args.aligned_loss:
                         with torch.no_grad():
+                            targf = targets_features_resize_full[i_train_map[align_target_i]]
+                            print('targf', targf.shape, targf.min(), targf.max(), targf.dtype)
                             print('target_feature_samples', target_feature_samples.shape, target_feature_samples.min(), target_feature_samples.max(), target_feature_samples.dtype)
                             print('rendered_features', rendered_features.shape, rendered_features.min(), rendered_features.max(), rendered_features.dtype)
                             print('rendered_features[0]', rendered_features[0].shape, rendered_features[0].min(), rendered_features[0].max(), rendered_features[0].dtype)
@@ -1177,6 +1179,8 @@ def train():
                             print('acc_map', rendered_acc_map.shape, rendered_acc_map.min(), rendered_acc_map.max(), rendered_acc_map.dtype)
                             print('acc0', rendered_acc0.shape, rendered_acc0.min(), rendered_acc0.max(), rendered_acc0.dtype)
 
+
+                        metrics['train_aligned/target_feature'] = make_wandb_image(targets_features_resize_full[i_train_map[align_target_i]][...,None].mean(0))
                         metrics['train_aligned/target_feature_samples'] = make_wandb_image(target_feature_samples[0,...,None].mean(0))
                         metrics['train_aligned/rendered_features'] = make_wandb_image(rendered_features[0,...,None].mean(0))
                         metrics['train_aligned/rendered_features0'] = make_wandb_image(rendered_features[1,...,None].mean(0))
