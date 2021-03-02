@@ -13,10 +13,11 @@ nerf-pytorch/ (this repository)
 CLIP/ (Fork of OpenAI's clip repository with a wrapper)
 ```
 
-Create conda environment:
+Create conda environment and login to wandb:
 ```
 conda env create -f environment.yml
 conda activate clip
+wandb login
 ```
 
 Set up our fork of CLIP:
@@ -34,6 +35,41 @@ cd data/
 ```
 
 Copy in and unzip nerf_llff_data and nerf_synthetic data folders.
+
+## Starter commands (synthetic lego blender scene)
+
+Feel free to add CUDA_VISIBLE_DEVICES=n to select the GPU to use. You need to add the CLIP repo to your PYTHONPATH, e.g. with `export PYTHONPATH=path/to/CLIP:$PYTHONPATH` or prepend `PYTHONPATH=path/to/CLIP:$PYTHONPATH` to each command.
+
+Reproduce NeRF with all 100+ views:
+```
+python run_nerf.py --config configs/000_blender_paper_lego.txt --wandb_entity <username>
+```
+
+Train NeRF with 8 views:
+```
+python run_nerf.py --config configs/004_blender_paper_lego.txt --wandb_entity <username>
+```
+
+Train NeRF with our global semantic consistency loss:
+```
+python run_nerf.py --config configs/067_blender_lego.txt --wandb_entity <username>
+```
+
+## Starter commands (fern scene)
+Reproduce NeRF with all 20 views:
+```
+python run_nerf.py --config configs/100_fern.txt --wandb_entity <username>
+```
+
+Train NeRF with 2 views:
+```
+python run_nerf.py --config configs/102_fern.txt --wandb_entity <username>
+```
+
+Train NeRF with our global semantic consistency loss: (this doesn't seem to be better than 102_fern)
+```
+python run_nerf.py --config configs/116_fern.txt --wandb_entity <username>
+```
 
 **NOTE** Instructions below are outdated.
 

@@ -705,6 +705,7 @@ def config_parser():
                         help='will take every 1/N images as LLFF test set, paper uses 8')
 
     # logging/saving options
+    parser.add_argument("--wandb_entity",   type=str, default='ajayj')
     parser.add_argument("--i_log",   type=int, default=1, 
                         help='frequency of metric logging')
     parser.add_argument("--i_log_raw_hist",   type=int, default=2, 
@@ -786,10 +787,10 @@ def config_parser():
 
 
 def train():
-    wandb.init(project="nerf-nl", entity="ajayj")
-
     parser = config_parser()
     args = parser.parse_args()
+
+    wandb.init(project="nerf-nl", entity=args.wandb_entity)
     wandb.run.name = args.expname
     wandb.run.save()
     wandb.config.update(args)
