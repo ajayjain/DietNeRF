@@ -34,7 +34,9 @@ mkdir data/
 cd data/
 ```
 
-Copy in and unzip nerf_llff_data and nerf_synthetic data folders.
+You need to download datasets
+from [NeRF's Google Drive folder](https://drive.google.com/drive/folders/128yBriW1IG_3NJ5Rp7APSTZsJqdJdfc1).
+Download `nerf_synthetic.zip` and `nerf_llff_data.zip`, then unzip them in the nerf-pytorch/data/ subdirectory.
 
 ## Starter commands (synthetic lego blender scene)
 
