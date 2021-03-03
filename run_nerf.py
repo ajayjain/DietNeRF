@@ -21,6 +21,8 @@ from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data, pose_spherical_uniform
 from run_nerf_helpers import *
+# from discriminator import PatchDiscriminator
+import gan_networks
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -600,11 +602,15 @@ def get_patch_similarity_matrix(embs1, embs2):
 
 
 @torch.no_grad()
-def make_wandb_image(tensor):
+def make_wandb_image(tensor, preprocess='scale'):
+    tensor = tensor.detach()
     tensor = tensor.float()
-    mi = tensor.min()
-    tensor = ((tensor - mi) / (tensor.max() - mi))
-    return wandb.Image(tensor.detach().cpu().numpy())
+    if preprocess == 'scale':
+        mi = tensor.min()
+        tensor = ((tensor - mi) / (tensor.max() - mi))
+    elif preprocess == 'clip':
+        tensor = tensor.clip(0, 1)
+    return wandb.Image(tensor.cpu().numpy())
 
 
 def config_parser():
@@ -732,6 +738,7 @@ def config_parser():
     # Options for rendering shared between different losses
     parser.add_argument("--render_loss_interval", "--consistency_loss_interval",
         type=float, default=1)
+    parser.add_argument("--render_autocast", action='store_true')
     parser.add_argument("--render_poses", "--consistency_poses",
         type=str, choices=['loaded', 'interpolate_train_all', 'uniform'], default='loaded')
     parser.add_argument("--render_poses_translation_jitter_sigma", "--consistency_poses_translation_jitter_sigma",
@@ -781,7 +788,22 @@ def config_parser():
                         help="weight for the coarse network's aligned semantic consistency loss")
 
     # Discriminator losses
-    parser.add_argument("--adversarial_loss", action='store_true')
+    parser.add_argument("--patch_gan_loss", action='store_true')
+    # Train options from BiCycleGAN
+    parser.add_argument('--patch_gan_mode', type=str, default='lsgan', help='the type of GAN objective. [vanilla | lsgan ｜ wgangp]. vanilla GAN loss is the cross-entropy objective used in the original GAN paper.')
+    parser.add_argument('--patch_gan_G_lam', type=float, default=1.0, help='weight on D loss backpropped to NeRF. D(G(random_pose))')
+    parser.add_argument('--patch_gan_lr', type=float, default=0.0002, help='initial learning rate for adam')
+    parser.add_argument('--patch_gan_beta1', type=float, default=0.5, help='momentum term of adam')
+    # parser.add_argument('--patch_gan_lr_policy', type=str, default='linear', help='learning rate policy: linear | step | plateau | cosine')
+    # parser.add_argument('--patch_gan_lr_decay_iters', type=int, default=100, help='multiply by a gamma every lr_decay_iters iterations')
+    # Base options from BiCycleGAN
+    parser.add_argument('--patch_gan_num_Ds', type=int, default=1, help='number of Discrminators')
+    parser.add_argument('--patch_gan_netD', type=str, default='basic_256_multi', help='selects model to use for netD')
+    parser.add_argument('--patch_gan_ndf', type=int, default=64, help='# of discrim filters in the first conv layer')
+    parser.add_argument('--patch_gan_norm', type=str, default='instance', help='instance normalization or batch normalization')
+    parser.add_argument('--patch_gan_init_type', type=str, default='xavier', help='network initialization [normal | xavier | kaiming | orthogonal]')
+    parser.add_argument('--patch_gan_init_gain', type=float, default=0.02, help='scaling factor for normal, xavier and orthogonal.')
+    parser.add_argument('--patch_gan_nl', type=str, default='relu', help='non-linearity activation: relu | lrelu | elu')
 
     return parser
 
@@ -996,26 +1018,29 @@ def train():
     print('TEST views are', i_test)
     print('VAL views are', i_val)
 
-    # Embed training images for consistency loss
     calc_ctr_loss = args.consistency_loss.startswith('consistent_with_target_rep')
+    any_rendered_loss = (calc_ctr_loss or args.aligned_loss or args.patch_gan_loss)
+    if any_rendered_loss:
+        with torch.no_grad():
+            targets = images[i_train].permute(0, 3, 1, 2)
+
+    # Embed training images for consistency loss
     if calc_ctr_loss:
         with torch.no_grad():
             i_train_map = {it: i for i, it in enumerate(i_train)}  # map from indices into all images to indices in selected training images
-            targets = images[i_train].permute(0, 3, 1, 2)
             if args.consistency_target_augmentation != 'none':
                 raise NotImplementedError
             targets_resize_model = F.interpolate(targets, (args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
             target_embeddings = embed(targets_resize_model)  # [N,L,D]
 
     # Embed training images for aligned consistency loss
+    consistency_keep_keys = ['rgb_map', 'rgb0']
     if args.aligned_loss:
         assert calc_ctr_loss
         assert args.dataset_type != 'llff' or args.no_ndc  # Haven't written working transform code for NDC
         assert not args.render_jitter_rays  # Translating the rays leads to a mismatched alignment
 
         with torch.no_grad():
-            targets = images[i_train].permute(0, 3, 1, 2)
-
             # Embed targets
             target_features = embed_spatial(targets_resize_model)  # [N,C,fH,fW]
 
@@ -1024,14 +1049,30 @@ def train():
 
             principal_point = torch.tensor([[H/2., W/2.]], device=device)
 
-    consistency_keep_keys = ['rgb_map', 'rgb0']
-    if args.aligned_loss:
         consistency_keep_keys = ['rgb_map', 'rgb0', 'pts', 'pts0', 'weights', 'weights0', 'acc_map', 'acc0']
  
+    if args.patch_gan_loss:
+        netD = gan_networks.define_D(3,
+            args.patch_gan_ndf,
+            netD=args.patch_gan_netD,
+            norm=args.patch_gan_norm,
+            nl=args.patch_gan_nl,
+            init_type=args.patch_gan_init_type,
+            init_gain=args.patch_gan_init_gain,
+            num_Ds=args.patch_gan_num_Ds).to(device)
+        criterionGAN = gan_networks.GANLoss(gan_mode=args.patch_gan_mode).to(device)
+        optimizer_D = torch.optim.Adam(netD.parameters(), lr=args.patch_gan_lr, betas=(args.patch_gan_beta1, 0.999))
+
+        if args.patch_gan_netD.startswith('basic_128'):
+            discrim_size = 128
+        elif args.patch_gan_netD.startswith('basic_256'):
+            discrim_size = 256
+
+        with torch.no_grad():
+            targets_resize_D = F.interpolate(targets, (discrim_size, discrim_size), mode=args.pixel_interp_mode)
 
     start = start + 1
     for i in trange(start, N_iters):
-        time0 = time.time()
         metrics = {}
 
         # Sample random ray batch
@@ -1065,7 +1106,7 @@ def train():
 
             # Representational consistency loss with rendered image
             render_loss_iter = i % args.render_loss_interval == 0
-            if (calc_ctr_loss or args.aligned_loss or args.adversarial_loss) and render_loss_iter:
+            if (calc_ctr_loss or args.aligned_loss or args.patch_gan_loss) and render_loss_iter:
                 with torch.no_grad():
                     # Render from a random viewpoint
                     if args.render_poses == 'loaded':
@@ -1091,12 +1132,13 @@ def train():
                     rays = get_rays(H, W, focal, c2w=pose, nH=args.render_nH, nW=args.render_nW,
                                     jitter=args.render_jitter_rays)
 
-                extras = render(H, W, focal, chunk=args.chunk, rays=rays,
-                                keep_keys=consistency_keep_keys,
-                                **render_kwargs_train)[-1]
-                # rgb0 is the rendering from the coarse network, while rgb_map uses the fine network
-                rgbs = torch.stack([extras['rgb_map'], extras['rgb0']], dim=0)
-                rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
+                with torch.cuda.amp.autocast(enabled=args.render_autocast):
+                    extras = render(H, W, focal, chunk=args.chunk, rays=rays,
+                                    keep_keys=consistency_keep_keys,
+                                    **render_kwargs_train)[-1]
+                    # rgb0 is the rendering from the coarse network, while rgb_map uses the fine network
+                    rgbs = torch.stack([extras['rgb_map'], extras['rgb0']], dim=0)
+                    rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
 
                 if i == 0:
                     print('rendering losses rendered rgb image shape:', rgbs.shape)
@@ -1138,13 +1180,13 @@ def train():
                     rendered_acc_map = extras['acc_map']
                     rendered_acc0 = extras['acc0']
 
-                if args.adversarial_loss:
-                    raise NotImplementedError
+                if args.patch_gan_loss:
+                    rgbs_resize_D = F.interpolate(rgbs, (discrim_size, discrim_size), mode=args.pixel_interp_mode)
 
                 if i%args.i_log_rendered_img==0:
-                    metrics['train_ctr/target'] = wandb.Image(target.detach().cpu().numpy())
-                    metrics['train_ctr/rgb'] = wandb.Image(extras['rgb_map'].detach().cpu().numpy())
-                    metrics['train_ctr/rgb0'] = wandb.Image(extras['rgb0'].detach().cpu().numpy())
+                    metrics['train_ctr/target'] = make_wandb_image(target, 'clip')
+                    metrics['train_ctr/rgb'] = make_wandb_image(extras['rgb_map'], 'clip')
+                    metrics['train_ctr/rgb0'] = make_wandb_image(extras['rgb0'], 'clip')
 
                     if args.aligned_loss:
                         with torch.no_grad():
@@ -1171,6 +1213,7 @@ def train():
                                                 **render_kwargs_train)
 
         optimizer.zero_grad()
+        optimizer_D.zero_grad()
         img_loss = img2mse(rgb, target_s)
         trans = extras['raw'][...,-1]
         loss = img_loss
@@ -1251,8 +1294,39 @@ def train():
             loss = (loss + aligned_loss * args.aligned_loss_lam +
                     aligned_loss0 * args.aligned_loss_lam0)
 
-        loss.backward()
+        if args.patch_gan_loss and render_loss_iter:
+            # TODO: train discriminator on targets every iteration?
+            # Compute realism loss for NeRF training
+            gan_networks.set_requires_grad([netD], False)
+            pred_fake = netD(rgbs_resize_D)
+            loss_G, _ = criterionGAN(pred_fake, True)
+            # print('patch_gan gen: pred_fake', pred_fake.shape, 'loss_G', loss_G.shape)
+            loss = loss + loss_G * args.patch_gan_G_lam
+
+            metrics['train_patch_gan/G/loss_G'] = loss_G.item()
+            metrics['train_patch_gan/G/pred_fake'] = wandb.Histogram(pred_fake.detach().flatten().cpu().numpy())
+
+        loss.backward()  # TODO: do we need to set retain_graph=True?
         optimizer.step()
+
+        if args.patch_gan_loss and render_loss_iter:
+            # Compute loss for discriminator training
+            gan_networks.set_requires_grad([netD], True)
+            optimizer_D.zero_grad()
+            pred_fake = netD(rgbs_resize_D.detach())
+            pred_real = netD(targets_resize_D)
+            loss_D_fake, _ = criterionGAN(pred_fake, False)
+            loss_D_real, _ = criterionGAN(pred_real, True)
+            loss_D = loss_D_fake + loss_D_real
+            # print('patch_gan discrim: pred_fake', pred_fake.shape, 'pred_real', pred_real.shape, 'loss_D', loss_D.shape)
+            loss_D.backward()
+            optimizer_D.step()
+
+            metrics['train_patch_gan/D/loss_D'] = loss_D.item()
+            metrics['train_patch_gan/D/loss_D_fake'] = loss_D_fake.item()
+            metrics['train_patch_gan/D/loss_D_real'] = loss_D_real.item()
+            metrics['train_patch_gan/D/pred_fake'] = wandb.Histogram(pred_fake.detach().flatten().cpu().numpy())
+            metrics['train_patch_gan/D/pred_real'] = wandb.Histogram(pred_real.detach().flatten().cpu().numpy())
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
@@ -1306,15 +1380,18 @@ def train():
                 "gradients/norm": gradient_norm(network_fine.parameters()),
                 "gradients/norm0": gradient_norm(network_fn.parameters()),
                 "train/lrate": new_lrate,
-           })
+            })
             if args.N_importance > 0:
                 metrics["train/psnr0"] = psnr0.item()
-            if calc_ctr_loss and render_loss_iter:
-                metrics["train_ctr/consistency_loss"] = consistency_loss.item()
-                metrics["train_ctr/consistency_loss0"] = consistency_loss0.item()
-            if args.aligned_loss and render_loss_iter:
-                metrics["train_aligned/aligned_loss"] = aligned_loss.item()
-                metrics["train_aligned/aligned_loss0"] = aligned_loss0.item()
+            if render_loss_iter:
+                if calc_ctr_loss:
+                    metrics["train_ctr/consistency_loss"] = consistency_loss.item()
+                    metrics["train_ctr/consistency_loss0"] = consistency_loss0.item()
+                if args.aligned_loss:
+                    metrics["train_aligned/aligned_loss"] = aligned_loss.item()
+                    metrics["train_aligned/aligned_loss0"] = aligned_loss0.item()
+                if args.patch_gan_loss:
+                    metrics["gradients/normD"] = gradient_norm(netD.parameters())
 
         if i%args.i_log_raw_hist==0:
             metrics["train/tran"] = wandb.Histogram(trans.detach().cpu().numpy())

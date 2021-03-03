@@ -3,14 +3,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class discriminator(nn.Module):
+class PatchDiscriminator(nn.Module):
     """PatchGAN discriminator from pix2pix
     Modified to take 3 channels rather than 6.
     https://github.com/znxlwm/pytorch-pix2pix/blob/3059f2af53324e77089bbcfc31279f01a38c40b8/network.py#L104
     """
     # initializers
     def __init__(self, d=64):
-        super(discriminator, self).__init__()
+        super().__init__()
         self.conv1 = nn.Conv2d(3, d, 4, 2, 1)
         self.conv2 = nn.Conv2d(d, d * 2, 4, 2, 1)
         self.conv2_bn = nn.BatchNorm2d(d * 2)
