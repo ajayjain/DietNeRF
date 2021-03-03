@@ -796,8 +796,10 @@ def config_parser():
     parser.add_argument("--patch_gan_G_num_augs", type=int, default=1)
     parser.add_argument("--patch_gan_D_fake_num_augs", type=int, default=1)
     parser.add_argument("--patch_gan_D_real_num_augs", type=int, default=1)
-    parser.add_argument("--patch_gan_D_min_loss", type=float, default=None)
-    parser.add_argument("--patch_gan_G_min_loss", type=float, default=None)
+    parser.add_argument("--patch_gan_D_min_loss", type=float, default=-1)
+    parser.add_argument("--patch_gan_D_min_loss_real", type=float, default=-1)
+    parser.add_argument("--patch_gan_D_min_loss_fake", type=float, default=-1)
+    parser.add_argument("--patch_gan_G_min_loss", type=float, default=-1)
     # Train options from BiCycleGAN
     parser.add_argument('--patch_gan_mode', type=str, default='lsgan', help='the type of GAN objective. [vanilla | lsgan ｜ wgangp]. vanilla GAN loss is the cross-entropy objective used in the original GAN paper.')
     parser.add_argument('--patch_gan_G_lam', type=float, default=1.0, help='weight on D loss backpropped to NeRF. D(G(random_pose))')
@@ -1077,6 +1079,10 @@ def train():
             discrim_size = 128
         elif args.patch_gan_netD.startswith('basic_256'):
             discrim_size = 256
+        elif args.patch_gan_netD.startswith('graf_32'):
+            discrim_size = 168
+        elif args.patch_gan_netD.startswith('graf_64'):
+            discrim_size = 168
 
         pixel_interp_code = {
             'nearest': PIL.Image.NEAREST,
@@ -1317,7 +1323,10 @@ def train():
             rgbs_G = torch.cat([patch_gan_aug(rgbs) for _ in range(args.patch_gan_G_num_augs)])
             pred_fake = netD(rgbs_G)
             loss_G, _ = criterionGAN(pred_fake, True)
-            loss = loss + loss_G * args.patch_gan_G_lam
+            if args.patch_gan_G_min_loss is None or loss_G.item() > args.patch_gan_G_min_loss:
+                # Modified loss balancing trick from https://twitter.com/theshawwn/status/1260476167053869057
+                # NOTE: does not stop generator loss when discriminator loss is too high
+                loss = loss + loss_G * args.patch_gan_G_lam
 
             metrics['train_patch_gan/G/rgbs_G'] = make_wandb_image(rgbs_G[0].permute(1,2,0), 'clip')  # fine network
             metrics['train_patch_gan/G/rgbs0_G'] = make_wandb_image(rgbs_G[1].permute(1,2,0), 'clip')  # coarse network
@@ -1339,11 +1348,23 @@ def train():
                 pred_real = netD(targets_D)
                 loss_D_fake, _ = criterionGAN(pred_fake, False)
                 loss_D_real, _ = criterionGAN(pred_real, True)
+
+                # Loss balancing trick from https://twitter.com/theshawwn/status/1260476167053869057
+                # Only update D if loss is sufficiently high
+                if args.patch_gan_D_min_loss_fake is not None and loss_D_fake.item() <= args.patch_gan_D_min_loss_fake:
+                    loss_D_fake = torch.tensor(args.patch_gan_D_min_loss_fake, device=device)
+                if args.patch_gan_D_min_loss_real is not None and loss_D_real.item() <= args.patch_gan_D_min_loss_real:
+                    loss_D_real = torch.tensor(args.patch_gan_D_min_loss_real, device=device)
+
                 loss_D = loss_D_fake + loss_D_real
-                loss_D.backward()
-                if args.patch_gan_D_grad_clip > 0:
-                    nn.utils.clip_grad.clip_grad_norm_(netD.parameters(), max_norm=args.patch_gan_D_grad_clip)
-                optimizer_D.step()
+                if args.patch_gan_D_min_loss is not None and loss_D.item() <= args.patch_gan_D_min_loss:
+                    loss_D = torch.tensor(args.patch_gan_D_min_loss, device=device)  # thus, don't update discriminator
+
+                if loss_D.requires_grad:
+                    loss_D.backward()
+                    if args.patch_gan_D_grad_clip > 0:
+                        nn.utils.clip_grad.clip_grad_norm_(netD.parameters(), max_norm=args.patch_gan_D_grad_clip)
+                    optimizer_D.step()
 
             metrics['train_patch_gan/D/rgbs_D'] = make_wandb_image(rgbs_D[0].permute(1,2,0), 'clip')  # fine network
             metrics['train_patch_gan/D/rgbs0_D'] = make_wandb_image(rgbs_D[1].permute(1,2,0), 'clip')  # coarse network

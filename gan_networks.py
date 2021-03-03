@@ -6,6 +6,8 @@ from torch.nn import init
 import functools
 from torch.optim import lr_scheduler
 
+from discriminator_graf import GRAFDiscriminator
+
 ###############################################################################
 # Helper functions
 ###############################################################################
@@ -160,6 +162,10 @@ def define_D(input_nc, ndf, netD, norm='batch', nl='lrelu', init_type='xavier', 
         net = D_NLayersMulti(input_nc=input_nc, ndf=ndf, n_layers=2, norm_layer=norm_layer, num_D=num_Ds)
     elif netD == 'basic_256_multi':
         net = D_NLayersMulti(input_nc=input_nc, ndf=ndf, n_layers=3, norm_layer=norm_layer, num_D=num_Ds)
+    elif netD == 'graf_32':
+        net = GRAFDiscriminator(nc=3, ndf=ndf, imsize=32)
+    elif netD == 'graf_64':
+        net = GRAFDiscriminator(nc=3, ndf=ndf, imsize=64)
     else:
         raise NotImplementedError('Discriminator model name [%s] is not recognized' % net)
     return init_net(net, init_type, init_gain, gpu_ids)
