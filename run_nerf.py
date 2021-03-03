@@ -6,6 +6,7 @@ import clip_utils
 import configargparse
 import imageio
 import numpy as np
+import PIL
 from scipy.spatial.transform import Rotation
 import timm
 import torch
@@ -789,6 +790,14 @@ def config_parser():
 
     # Discriminator losses
     parser.add_argument("--patch_gan_loss", action='store_true')
+    parser.add_argument("--patch_gan_D_inner_steps", type=int, default=1)
+    parser.add_argument("--patch_gan_D_grad_clip", type=float, default=-1)
+    parser.add_argument("--patch_gan_D_rand_crop", action='store_true')
+    parser.add_argument("--patch_gan_G_num_augs", type=int, default=1)
+    parser.add_argument("--patch_gan_D_fake_num_augs", type=int, default=1)
+    parser.add_argument("--patch_gan_D_real_num_augs", type=int, default=1)
+    parser.add_argument("--patch_gan_D_min_loss", type=float, default=None)
+    parser.add_argument("--patch_gan_G_min_loss", type=float, default=None)
     # Train options from BiCycleGAN
     parser.add_argument('--patch_gan_mode', type=str, default='lsgan', help='the type of GAN objective. [vanilla | lsgan ｜ wgangp]. vanilla GAN loss is the cross-entropy objective used in the original GAN paper.')
     parser.add_argument('--patch_gan_G_lam', type=float, default=1.0, help='weight on D loss backpropped to NeRF. D(G(random_pose))')
@@ -1060,6 +1069,7 @@ def train():
             init_type=args.patch_gan_init_type,
             init_gain=args.patch_gan_init_gain,
             num_Ds=args.patch_gan_num_Ds).to(device)
+        print('Discriminator:', netD)
         criterionGAN = gan_networks.GANLoss(gan_mode=args.patch_gan_mode).to(device)
         optimizer_D = torch.optim.Adam(netD.parameters(), lr=args.patch_gan_lr, betas=(args.patch_gan_beta1, 0.999))
 
@@ -1068,8 +1078,17 @@ def train():
         elif args.patch_gan_netD.startswith('basic_256'):
             discrim_size = 256
 
-        with torch.no_grad():
-            targets_resize_D = F.interpolate(targets, (discrim_size, discrim_size), mode=args.pixel_interp_mode)
+        pixel_interp_code = {
+            'nearest': PIL.Image.NEAREST,
+            'bilinear': PIL.Image.BILINEAR,
+            'bicubic': PIL.Image.BICUBIC
+        }[args.pixel_interp_mode]
+        if args.patch_gan_D_rand_crop:
+            scale = (discrim_size/min(args.render_nH, args.render_nW), 1)
+            patch_gan_aug = torchvision.transforms.RandomResizedCrop(
+                discrim_size, scale=scale, interpolation=pixel_interp_code)
+        else:
+           patch_gan_aug = torchvision.transforms.Resize(discrim_size, pixel_interp_code)
 
     start = start + 1
     for i in trange(start, N_iters):
@@ -1179,9 +1198,6 @@ def train():
                     # Save acc map for loss calculation
                     rendered_acc_map = extras['acc_map']
                     rendered_acc0 = extras['acc0']
-
-                if args.patch_gan_loss:
-                    rgbs_resize_D = F.interpolate(rgbs, (discrim_size, discrim_size), mode=args.pixel_interp_mode)
 
                 if i%args.i_log_rendered_img==0:
                     metrics['train_ctr/target'] = make_wandb_image(target, 'clip')
@@ -1298,11 +1314,13 @@ def train():
             # TODO: train discriminator on targets every iteration?
             # Compute realism loss for NeRF training
             gan_networks.set_requires_grad([netD], False)
-            pred_fake = netD(rgbs_resize_D)
+            rgbs_G = torch.cat([patch_gan_aug(rgbs) for _ in range(args.patch_gan_G_num_augs)])
+            pred_fake = netD(rgbs_G)
             loss_G, _ = criterionGAN(pred_fake, True)
-            # print('patch_gan gen: pred_fake', pred_fake.shape, 'loss_G', loss_G.shape)
             loss = loss + loss_G * args.patch_gan_G_lam
 
+            metrics['train_patch_gan/G/rgbs_G'] = make_wandb_image(rgbs_G[0].permute(1,2,0), 'clip')  # fine network
+            metrics['train_patch_gan/G/rgbs0_G'] = make_wandb_image(rgbs_G[1].permute(1,2,0), 'clip')  # coarse network
             metrics['train_patch_gan/G/loss_G'] = loss_G.item()
             metrics['train_patch_gan/G/pred_fake'] = wandb.Histogram(pred_fake.detach().flatten().cpu().numpy())
 
@@ -1312,16 +1330,24 @@ def train():
         if args.patch_gan_loss and render_loss_iter:
             # Compute loss for discriminator training
             gan_networks.set_requires_grad([netD], True)
-            optimizer_D.zero_grad()
-            pred_fake = netD(rgbs_resize_D.detach())
-            pred_real = netD(targets_resize_D)
-            loss_D_fake, _ = criterionGAN(pred_fake, False)
-            loss_D_real, _ = criterionGAN(pred_real, True)
-            loss_D = loss_D_fake + loss_D_real
-            # print('patch_gan discrim: pred_fake', pred_fake.shape, 'pred_real', pred_real.shape, 'loss_D', loss_D.shape)
-            loss_D.backward()
-            optimizer_D.step()
+            for _ in range(args.patch_gan_D_inner_steps):
+                optimizer_D.zero_grad()
+                rgbs_D = rgbs.detach()
+                rgbs_D = torch.cat([patch_gan_aug(rgbs_D) for _ in range(args.patch_gan_D_fake_num_augs)])
+                targets_D = torch.cat([patch_gan_aug(targets) for _ in range(args.patch_gan_D_real_num_augs)])
+                pred_fake = netD(rgbs_D)
+                pred_real = netD(targets_D)
+                loss_D_fake, _ = criterionGAN(pred_fake, False)
+                loss_D_real, _ = criterionGAN(pred_real, True)
+                loss_D = loss_D_fake + loss_D_real
+                loss_D.backward()
+                if args.patch_gan_D_grad_clip > 0:
+                    nn.utils.clip_grad.clip_grad_norm_(netD.parameters(), max_norm=args.patch_gan_D_grad_clip)
+                optimizer_D.step()
 
+            metrics['train_patch_gan/D/rgbs_D'] = make_wandb_image(rgbs_D[0].permute(1,2,0), 'clip')  # fine network
+            metrics['train_patch_gan/D/rgbs0_D'] = make_wandb_image(rgbs_D[1].permute(1,2,0), 'clip')  # coarse network
+            metrics['train_patch_gan/D/targets_D'] = make_wandb_image(targets_D[np.random.randint(len(targets_D))].permute(1,2,0), 'clip')
             metrics['train_patch_gan/D/loss_D'] = loss_D.item()
             metrics['train_patch_gan/D/loss_D_fake'] = loss_D_fake.item()
             metrics['train_patch_gan/D/loss_D_real'] = loss_D_real.item()
