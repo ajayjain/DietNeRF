@@ -24,6 +24,7 @@ from load_blender import load_blender_data, pose_spherical_uniform
 from run_nerf_helpers import *
 # from discriminator import PatchDiscriminator
 import gan_networks
+import discriminator_singan
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -800,6 +801,7 @@ def config_parser():
     parser.add_argument("--patch_gan_D_min_loss_real", type=float, default=-1)
     parser.add_argument("--patch_gan_D_min_loss_fake", type=float, default=-1)
     parser.add_argument("--patch_gan_G_min_loss", type=float, default=-1)
+    parser.add_argument("--patch_gan_D_size", type=int, default=256)
     # Train options from BiCycleGAN
     parser.add_argument('--patch_gan_mode', type=str, default='lsgan', help='the type of GAN objective. [vanilla | lsgan ｜ wgangp]. vanilla GAN loss is the cross-entropy objective used in the original GAN paper.')
     parser.add_argument('--patch_gan_G_lam', type=float, default=1.0, help='weight on D loss backpropped to NeRF. D(G(random_pose))')
@@ -1075,14 +1077,15 @@ def train():
         criterionGAN = gan_networks.GANLoss(gan_mode=args.patch_gan_mode).to(device)
         optimizer_D = torch.optim.Adam(netD.parameters(), lr=args.patch_gan_lr, betas=(args.patch_gan_beta1, 0.999))
 
-        if args.patch_gan_netD.startswith('basic_128'):
-            discrim_size = 128
-        elif args.patch_gan_netD.startswith('basic_256'):
-            discrim_size = 256
-        elif args.patch_gan_netD.startswith('graf_32'):
-            discrim_size = 168
-        elif args.patch_gan_netD.startswith('graf_64'):
-            discrim_size = 168
+        # if args.patch_gan_netD.startswith('basic_128'):
+        #     discrim_size = 128
+        # elif args.patch_gan_netD.startswith('basic_256'):
+        #     discrim_size = 256
+        # elif args.patch_gan_netD.startswith('graf_32'):
+        #     discrim_size = 168
+        # elif args.patch_gan_netD.startswith('graf_64'):
+        #     discrim_size = 168
+        discrim_size = args.patch_gan_D_size
 
         pixel_interp_code = {
             'nearest': PIL.Image.NEAREST,
@@ -1325,10 +1328,13 @@ def train():
             # pred_fake = netD(rgbs_G)
 
             ## Flip fine network's rendering
-            assert rgbs.shape[2:] == (discrim_size, discrim_size)
             rgbs_G = torch.cat([rgbs[:1], rgbs[:1].flip(3)], dim=0)
-            pred_fake = netD(rgbs_G)
-            print('patch gan gen loss pred shapes', 'rgbs_G', rgbs_G.shape, 'pred_fake', pred_fake.shape)
+            if rgbs_G.shape[2:] != (discrim_size, discrim_size):
+                assert False
+                rgbs_G = F.interpolate(rgbs_G, (discrim_size, discrim_size), mode=args.pixel_interp_mode)
+            pred_fake = netD(rgbs_G * 2 - 1)
+            if args.patch_gan_num_Ds > 1:
+                print('patch gan gen loss pred shapes', 'rgbs_G', rgbs_G.shape, 'pred_fake', len(pred_fake), list(map(lambda x: x.shape, pred_fake)))
 
             loss_G, _ = criterionGAN(pred_fake, True)
             if args.patch_gan_G_min_loss is None or loss_G.item() > args.patch_gan_G_min_loss:
@@ -1339,7 +1345,11 @@ def train():
             metrics['train_patch_gan/G/rgbs_G'] = make_wandb_image(rgbs_G[0].permute(1,2,0), 'clip')  # fine network
             # metrics['train_patch_gan/G/rgbs0_G'] = make_wandb_image(rgbs_G[1].permute(1,2,0), 'clip')  # coarse network
             metrics['train_patch_gan/G/loss_G'] = loss_G.item()
-            metrics['train_patch_gan/G/pred_fake'] = wandb.Histogram(pred_fake.detach().flatten().cpu().numpy())
+            if args.patch_gan_num_Ds == 1:
+                metrics['train_patch_gan/G/pred_fake'] = wandb.Histogram(pred_fake.detach().flatten().cpu().numpy())
+            else:
+                for disc_id, preds in enumerate(pred_fake):
+                    metrics[f'train_patch_gan/G/pred_fake_D{disc_id}'] = wandb.Histogram(preds.detach().flatten().cpu().numpy())
 
         loss.backward()  # TODO: do we need to set retain_graph=True?
         optimizer.step()
@@ -1357,24 +1367,35 @@ def train():
                 # pred_real = netD(targets_D)
 
                 ## Flip fine net rendering and targets
-                rgbs_D = rgbs.detach()[:1]
-                rgbs_D = torch.cat([rgbs_D, rgbs_D.flip(3)], dim=0)
-                assert rgbs.shape[2:] == (discrim_size, discrim_size)
-                targets_D = F.interpolate(targets.detach(), (discrim_size, discrim_size), mode=args.pixel_interp_mode)
-                targets_D = torch.cat([targets_D, targets_D.flip(3)], dim=0)
-                all_D = torch.cat([rgbs_D, targets_D], dim=0)
-                pred_all = netD(all_D)
-                pred_fake, pred_real = pred_all[:rgbs_D.shape[0]], pred_all[rgbs_D.shape[0]:]
-                print('patch gan disc loss pred shapes', 'rgbs_D', rgbs_D.shape, 'pred_fake', pred_fake.shape, 'targets_D', targets_D.shape, 'pred_real', pred_real.shape)
+                with torch.no_grad():
+                    rgbs_D = rgbs.detach()[:1]
+                    rgbs_D = torch.cat([rgbs_D, rgbs_D.flip(3)], dim=0)
+                    if rgbs_D.shape[2:] != (discrim_size, discrim_size):
+                        assert False
+                        rgbs_D = F.interpolate(rgbs_D, (discrim_size, discrim_size), mode=args.pixel_interp_mode)
+
+                    targets_D = targets[np.random.randint(len(targets))].unsqueeze(0)
+                    targets_D = torch.cat([targets_D, targets_D.flip(3)], dim=0)
+                    if targets_D.shape[2:] != (discrim_size, discrim_size):
+                        targets_D = F.interpolate(targets.detach(), (discrim_size, discrim_size), mode=args.pixel_interp_mode)
+
+                    all_D = torch.cat([rgbs_D, targets_D], dim=0)
+                pred_all = netD(all_D * 2 - 1)
+                if args.patch_gan_num_Ds > 1:
+                    pred_fake = [p[:rgbs_D.shape[0]] for p in pred_all]
+                    pred_real = [p[rgbs_D.shape[0]:] for p in pred_all]
+                    print('patch gan disc loss pred shapes', 'rgbs_D', rgbs_D.shape, 'pred_fake', len(pred_fake), list(map(lambda x: x.shape, pred_fake)), 'targets_D', targets_D.shape, 'pred_real', len(pred_real), list(map(lambda x: x.shape, pred_real)))
+                else:
+                    pred_fake, pred_real = pred_all[:rgbs_D.shape[0]], pred_all[rgbs_D.shape[0]:]
 
                 loss_D_fake, _ = criterionGAN(pred_fake, False)
                 loss_D_real, _ = criterionGAN(pred_real, True)
 
                 # Loss balancing trick from https://twitter.com/theshawwn/status/1260476167053869057
                 # Only update D if loss is sufficiently high
-                if args.patch_gan_D_min_loss_fake is not None and loss_D_fake.item() <= args.patch_gan_D_min_loss_fake:
+                if args.patch_gan_D_min_loss_fake is not None and loss_D_fake <= args.patch_gan_D_min_loss_fake:
                     loss_D_fake = torch.tensor(args.patch_gan_D_min_loss_fake, device=device)
-                if args.patch_gan_D_min_loss_real is not None and loss_D_real.item() <= args.patch_gan_D_min_loss_real:
+                if args.patch_gan_D_min_loss_real is not None and loss_D_real <= args.patch_gan_D_min_loss_real:
                     loss_D_real = torch.tensor(args.patch_gan_D_min_loss_real, device=device)
 
                 loss_D = loss_D_fake + loss_D_real
@@ -1383,18 +1404,33 @@ def train():
 
                 if loss_D.requires_grad:
                     loss_D.backward()
-                    if args.patch_gan_D_grad_clip > 0:
-                        nn.utils.clip_grad.clip_grad_norm_(netD.parameters(), max_norm=args.patch_gan_D_grad_clip)
+                    if args.patch_gan_mode == 'wgangp':
+                        # gradient_penalty = gan_networks.cal_gradient_penalty(netD, rgbs_D, targets_D, lambda_gp=0.1, device=device)
+                        penalty_target_idx = np.random.choice(targets_D.shape[0], size=rgbs_D.shape[0], replace=False)
+                        gradient_penalty = discriminator_singan.calc_gradient_penalty(
+                            netD, fake_data=rgbs_D, real_data=targets_D[penalty_target_idx], LAMBDA=0.1, device=device)
+                        gradient_penalty.backward()
+                        loss_D += gradient_penalty
+                        metrics['train_patch_gan/D/gradient_penality'] = gradient_penalty
+                    else:
+                        if args.patch_gan_D_grad_clip > 0:
+                            nn.utils.clip_grad.clip_grad_norm_(netD.parameters(), max_norm=args.patch_gan_D_grad_clip)
                     optimizer_D.step()
 
             metrics['train_patch_gan/D/rgbs_D'] = make_wandb_image(rgbs_D[0].permute(1,2,0), 'clip')  # fine network
-            metrics['train_patch_gan/D/rgbs0_D'] = make_wandb_image(rgbs_D[1].permute(1,2,0), 'clip')  # coarse network
+            # metrics['train_patch_gan/D/rgbs0_D'] = make_wandb_image(rgbs_D[1].permute(1,2,0), 'clip')  # coarse network
             metrics['train_patch_gan/D/targets_D'] = make_wandb_image(targets_D[np.random.randint(len(targets_D))].permute(1,2,0), 'clip')
-            metrics['train_patch_gan/D/loss_D'] = loss_D.item()
-            metrics['train_patch_gan/D/loss_D_fake'] = loss_D_fake.item()
-            metrics['train_patch_gan/D/loss_D_real'] = loss_D_real.item()
-            metrics['train_patch_gan/D/pred_fake'] = wandb.Histogram(pred_fake.detach().flatten().cpu().numpy())
-            metrics['train_patch_gan/D/pred_real'] = wandb.Histogram(pred_real.detach().flatten().cpu().numpy())
+            metrics['train_patch_gan/D/loss_D'] = loss_D
+            metrics['train_patch_gan/D/loss_D_fake'] = loss_D_fake
+            metrics['train_patch_gan/D/loss_D_real'] = loss_D_real
+            if args.patch_gan_num_Ds == 1:
+                metrics['train_patch_gan/D/pred_fake'] = wandb.Histogram(pred_fake.detach().flatten().cpu().numpy())
+                metrics['train_patch_gan/D/pred_real'] = wandb.Histogram(pred_real.detach().flatten().cpu().numpy())
+            else:
+                for disc_id, preds in enumerate(pred_fake):
+                    metrics[f'train_patch_gan/D/pred_fake_D{disc_id}'] = wandb.Histogram(preds.detach().flatten().cpu().numpy())
+                for disc_id, preds in enumerate(pred_real):
+                    metrics[f'train_patch_gan/D/pred_real_D{disc_id}'] = wandb.Histogram(preds.detach().flatten().cpu().numpy())
 
         # NOTE: IMPORTANT!
         ###   update learning rate   ###
@@ -1403,6 +1439,9 @@ def train():
         new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
         for param_group in optimizer.param_groups:
             param_group['lr'] = new_lrate
+        new_lrate_D = args.patch_gan_lr * (decay_rate ** (global_step / decay_steps))
+        for param_group in optimizer_D.param_groups:
+            param_group['lr'] = new_lrate_D
         #####           end            #####
 
         # Rest is logging
