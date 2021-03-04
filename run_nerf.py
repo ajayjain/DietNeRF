@@ -1317,11 +1317,19 @@ def train():
                     aligned_loss0 * args.aligned_loss_lam0)
 
         if args.patch_gan_loss and render_loss_iter:
-            # TODO: train discriminator on targets every iteration?
             # Compute realism loss for NeRF training
             gan_networks.set_requires_grad([netD], False)
-            rgbs_G = torch.cat([patch_gan_aug(rgbs) for _ in range(args.patch_gan_G_num_augs)])
+
+            ## Random resize crop both fine and coarse renderings
+            # rgbs_G = torch.cat([patch_gan_aug(rgbs) for _ in range(args.patch_gan_G_num_augs)])
+            # pred_fake = netD(rgbs_G)
+
+            ## Flip fine network's rendering
+            assert rgbs.shape[2:] == (discrim_size, discrim_size)
+            rgbs_G = torch.cat([rgbs[:1], rgbs[:1].flip(3)], dim=0)
             pred_fake = netD(rgbs_G)
+            print('patch gan gen loss pred shapes', 'rgbs_G', rgbs_G.shape, 'pred_fake', pred_fake.shape)
+
             loss_G, _ = criterionGAN(pred_fake, True)
             if args.patch_gan_G_min_loss is None or loss_G.item() > args.patch_gan_G_min_loss:
                 # Modified loss balancing trick from https://twitter.com/theshawwn/status/1260476167053869057
@@ -1329,7 +1337,7 @@ def train():
                 loss = loss + loss_G * args.patch_gan_G_lam
 
             metrics['train_patch_gan/G/rgbs_G'] = make_wandb_image(rgbs_G[0].permute(1,2,0), 'clip')  # fine network
-            metrics['train_patch_gan/G/rgbs0_G'] = make_wandb_image(rgbs_G[1].permute(1,2,0), 'clip')  # coarse network
+            # metrics['train_patch_gan/G/rgbs0_G'] = make_wandb_image(rgbs_G[1].permute(1,2,0), 'clip')  # coarse network
             metrics['train_patch_gan/G/loss_G'] = loss_G.item()
             metrics['train_patch_gan/G/pred_fake'] = wandb.Histogram(pred_fake.detach().flatten().cpu().numpy())
 
@@ -1341,11 +1349,24 @@ def train():
             gan_networks.set_requires_grad([netD], True)
             for _ in range(args.patch_gan_D_inner_steps):
                 optimizer_D.zero_grad()
-                rgbs_D = rgbs.detach()
-                rgbs_D = torch.cat([patch_gan_aug(rgbs_D) for _ in range(args.patch_gan_D_fake_num_augs)])
-                targets_D = torch.cat([patch_gan_aug(targets) for _ in range(args.patch_gan_D_real_num_augs)])
-                pred_fake = netD(rgbs_D)
-                pred_real = netD(targets_D)
+                ## Random resize crop both fine and coarse renderings
+                # rgbs_D = rgbs.detach()
+                # rgbs_D = torch.cat([patch_gan_aug(rgbs_D) for _ in range(args.patch_gan_D_fake_num_augs)])
+                # targets_D = torch.cat([patch_gan_aug(targets) for _ in range(args.patch_gan_D_real_num_augs)])
+                # pred_fake = netD(rgbs_D)
+                # pred_real = netD(targets_D)
+
+                ## Flip fine net rendering and targets
+                rgbs_D = rgbs.detach()[:1]
+                rgbs_D = torch.cat([rgbs_D, rgbs_D.flip(3)], dim=0)
+                assert rgbs.shape[2:] == (discrim_size, discrim_size)
+                targets_D = F.interpolate(targets.detach(), (discrim_size, discrim_size), mode=args.pixel_interp_mode)
+                targets_D = torch.cat([targets_D, targets_D.flip(3)], dim=0)
+                all_D = torch.cat([rgbs_D, targets_D], dim=0)
+                pred_all = netD(all_D)
+                pred_fake, pred_real = pred_all[:rgbs_D.shape[0]], pred_all[rgbs_D.shape[0]:]
+                print('patch gan disc loss pred shapes', 'rgbs_D', rgbs_D.shape, 'pred_fake', pred_fake.shape, 'targets_D', targets_D.shape, 'pred_real', pred_real.shape)
+
                 loss_D_fake, _ = criterionGAN(pred_fake, False)
                 loss_D_real, _ = criterionGAN(pred_real, True)
 
