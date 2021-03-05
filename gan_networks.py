@@ -148,23 +148,27 @@ def define_G(input_nc, output_nc, nz, ngf, netG='unet_128', norm='batch', nl='re
     return init_net(net, init_type, init_gain, gpu_ids)
 
 
-def define_D(input_nc, ndf, netD, norm='batch', nl='lrelu', init_type='xavier', init_gain=0.02, num_Ds=1, gpu_ids=[]):
+def define_D(input_nc, ndf, netD, norm='batch', nl='lrelu', activation='none', init_type='xavier', init_gain=0.02, num_Ds=1, gpu_ids=[]):
     net = None
     norm_layer = get_norm_layer(norm_type=norm)
     nl = 'lrelu'  # use leaky relu for D
     nl_layer = get_non_linearity(layer_type=nl)
 
     if netD == 'basic_128':
+        assert activation == 'none'
         net = D_NLayers(input_nc, ndf, n_layers=2, norm_layer=norm_layer, nl_layer=nl_layer)
     elif netD == 'basic_256':
+        assert activation == 'none'
         net = D_NLayers(input_nc, ndf, n_layers=3, norm_layer=norm_layer, nl_layer=nl_layer)
     elif netD == 'basic_128_multi':
-        net = D_NLayersMulti(input_nc=input_nc, ndf=ndf, n_layers=2, norm_layer=norm_layer, num_D=num_Ds)
+        net = D_NLayersMulti(input_nc=input_nc, ndf=ndf, n_layers=2, norm_layer=norm_layer, num_D=num_Ds, activation=activation)
     elif netD == 'basic_256_multi':
-        net = D_NLayersMulti(input_nc=input_nc, ndf=ndf, n_layers=3, norm_layer=norm_layer, num_D=num_Ds)
+        net = D_NLayersMulti(input_nc=input_nc, ndf=ndf, n_layers=3, norm_layer=norm_layer, num_D=num_Ds, activation=activation)
     elif netD == 'graf_32':
+        assert activation == 'none'
         net = GRAFDiscriminator(nc=3, ndf=ndf, imsize=32)
     elif netD == 'graf_64':
+        assert activation == 'none'
         net = GRAFDiscriminator(nc=3, ndf=ndf, imsize=64)
     else:
         raise NotImplementedError('Discriminator model name [%s] is not recognized' % net)
@@ -198,7 +202,8 @@ def define_E(input_nc, output_nc, ndf, netE,
 
 class D_NLayersMulti(nn.Module):
     def __init__(self, input_nc, ndf=64, n_layers=3,
-                 norm_layer=nn.BatchNorm2d, num_D=1):
+                 norm_layer=nn.BatchNorm2d, num_D=1,
+                 activation='none'):
         super(D_NLayersMulti, self).__init__()
         # st()
         self.num_D = num_D
@@ -214,6 +219,7 @@ class D_NLayersMulti(nn.Module):
                 ndf_i = int(round(ndf / (2**i)))
                 layers = self.get_layers(input_nc, ndf_i, n_layers, norm_layer)
                 self.add_module("model_%d" % i, nn.Sequential(*layers))
+        self.activation = nn.Sigmoid() if activation == 'sigmoid' else nn.Identity()
 
     def get_layers(self, input_nc, ndf=64, n_layers=3, norm_layer=nn.BatchNorm2d):
         kw = 4
@@ -244,7 +250,6 @@ class D_NLayersMulti(nn.Module):
 
         sequence += [nn.Conv2d(ndf * nf_mult, 1,
                                kernel_size=kw, stride=1, padding=padw)]
-
         return sequence
 
     def forward(self, input):
@@ -254,7 +259,7 @@ class D_NLayersMulti(nn.Module):
         down = input
         for i in range(self.num_D):
             model = getattr(self, "model_%d" % i)
-            result.append(model(down))
+            result.append(self.activation(model(down)))
             if i != self.num_D - 1:
                 down = self.down(down)
         return result
