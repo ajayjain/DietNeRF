@@ -4,7 +4,6 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 
-
 class ConvBlock(nn.Sequential):
     def __init__(self, in_channel, out_channel, ker_size, padd, stride):
         super(ConvBlock,self).__init__()
@@ -40,24 +39,27 @@ class WDiscriminator(nn.Module):
         x = self.tail(x)
         return x
 
-def calc_gradient_penalty(netD, real_data, fake_data, LAMBDA, device):
-    #print real_data.size()
-    alpha = torch.rand(1, 1)
-    alpha = alpha.expand(real_data.size())
-    alpha = alpha.to(device)#cuda() #gpu) #if use_cuda else alpha
+def calc_gradient_penalty(netD, real_data, fake_data, LAMBDA, device, retain_graph=True):
+    with torch.no_grad():
+        #print real_data.size()
+        alpha = torch.rand(1, 1)
+        alpha = alpha.expand(real_data.size())
+        alpha = alpha.to(device)#cuda() #gpu) #if use_cuda else alpha
 
-    interpolates = alpha * real_data + ((1 - alpha) * fake_data)
+        interpolates = alpha * real_data + ((1 - alpha) * fake_data)
 
 
     interpolates = interpolates.to(device)#.cuda()
-    interpolates = torch.autograd.Variable(interpolates, requires_grad=True)
+    # interpolates = torch.autograd.Variable(interpolates, requires_grad=True)
+    interpolates.requires_grad_(True)
 
     disc_interpolates = netD(interpolates)
+    grad_outputs = torch.ones_like(disc_interpolates)
 
     def _calc(disc_interpolates):
-        gradients = torch.autograd.grad(outputs=disc_interpolates, inputs=interpolates,
-                                grad_outputs=torch.ones(disc_interpolates.size()).to(device),
-                                create_graph=True, retain_graph=True, only_inputs=True)[0]
+        gradients = torch.autograd.grad(
+            outputs=disc_interpolates, inputs=interpolates, grad_outputs=grad_outputs,
+            create_graph=True, retain_graph=retain_graph, only_inputs=True)[0]
         gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * LAMBDA
         return gradient_penalty
 

@@ -24,9 +24,7 @@ from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data, pose_spherical_uniform
 from run_nerf_helpers import *
-# from discriminator import PatchDiscriminator
 import gan_networks
-import discriminator_singan
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -620,7 +618,16 @@ def make_wandb_image(tensor, preprocess='scale'):
 @torch.no_grad()
 def make_wandb_histogram(tensor):
     return wandb.Histogram(tensor.detach().flatten().cpu().numpy())
- 
+
+
+@torch.no_grad()
+def log_discriminator_histograms(metrics, key, preds):
+    if isinstance(preds, list):
+        for disc_id, pred in enumerate(preds):
+            metrics[f'{key}_D{disc_id}'] = make_wandb_histogram(pred)
+    else:
+        metrics[f'{key}_D0'] = make_wandb_histogram(preds)
+
 
 def config_parser():
     parser = configargparse.ArgumentParser()
@@ -1152,11 +1159,6 @@ def train():
                 if i == 0:
                     print('rendering losses rendered rgb image shape:', rgbs.shape)
 
-                if calc_ctr_loss:
-                    # Resize and embed rendered images
-                    rgbs_resize_c = F.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
-                    rendered_embedding, rendered_embedding0 = embed(rgbs_resize_c)
-
                 if args.aligned_loss:
                     # TODO: support sampling nearby targets
                     align_target_i = img_i
@@ -1170,6 +1172,7 @@ def train():
                     _, norm_uv0 = run_checkpoint(world_to_image, extras['pts0'], w2c, H, W, focal, principal_point)
 
                     # Embed rendered images into spatial features
+                    rgbs_resize_c = F.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
                     rendered_features = embed_spatial(rgbs_resize_c)  # [2, D, fH, fW] = [2, 256, 56, 56] for CLIP RN50
                     
                     _resample = functools.partial(resample_features, feature_interp_mode=args.feature_interp_mode)
@@ -1195,17 +1198,6 @@ def train():
                     metrics['train_ctr/rgb0'] = make_wandb_image(extras['rgb0'], 'clip')
 
                     if args.aligned_loss:
-                        with torch.no_grad():
-                            targf = targets_features_resize_full[i_train_map[align_target_i]]
-                            print('targf', targf.shape, targf.min(), targf.max(), targf.dtype)
-                            print('target_feature_samples', target_feature_samples.shape, target_feature_samples.min(), target_feature_samples.max(), target_feature_samples.dtype)
-                            print('rendered_features', rendered_features.shape, rendered_features.min(), rendered_features.max(), rendered_features.dtype)
-                            print('rendered_features[0]', rendered_features[0].shape, rendered_features[0].min(), rendered_features[0].max(), rendered_features[0].dtype)
-                            print('rendered_features[1]', rendered_features[1].shape, rendered_features[1].min(), rendered_features[1].max(), rendered_features[1].dtype)
-                            print('acc_map', rendered_acc_map.shape, rendered_acc_map.min(), rendered_acc_map.max(), rendered_acc_map.dtype)
-                            print('acc0', rendered_acc0.shape, rendered_acc0.min(), rendered_acc0.max(), rendered_acc0.dtype)
-
-
                         metrics['train_aligned/target_feature'] = make_wandb_image(targets_features_resize_full[i_train_map[align_target_i]][...,None].mean(0))
                         metrics['train_aligned/target_feature_samples'] = make_wandb_image(target_feature_samples[0,...,None].mean(0))
                         metrics['train_aligned/rendered_features'] = make_wandb_image(rendered_features[0,...,None].mean(0))
@@ -1214,70 +1206,56 @@ def train():
                         metrics['train_aligned/acc0'] = make_wandb_image(rendered_acc0.unsqueeze(-1))
 
         #####  Core optimization loop  #####
-        rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, rays=batch_rays,
-                                                verbose=i < 10, retraw=True,
-                                                **render_kwargs_train)
 
         optimizer.zero_grad()
-        optimizer_D.zero_grad()
-        img_loss = img2mse(rgb, target_s)
-        trans = extras['raw'][...,-1]
-        loss = img_loss
-        psnr = mse2psnr(img_loss)
-
-        if 'rgb0' in extras:
-            if i == start:
-                print('Using auxilliary rgb0 mse loss')
-            img_loss0 = img2mse(extras['rgb0'], target_s)
-            loss = loss + img_loss0
-            psnr0 = mse2psnr(img_loss0)
-
-        if args.no_mse:
-            loss = 0
+        loss = 0
 
         if calc_ctr_loss and render_loss_iter:
-            if args.consistency_loss == 'consistent_with_target_rep':
-                # NOTE: Randomly sampling a target (run 031) is worse than sampling the same target as MSE (run 032)
-                target_i = i_train_map[img_i]
+            assert args.consistency_loss == 'consistent_with_target_rep'
 
-                assert rendered_embedding.ndim == 2  # [L,D]
-                assert target_embeddings.ndim == 3  # [N,L,D]
+            # Resize and embed rendered images
+            rgbs_resize_c = F.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
+            rendered_embedding, rendered_embedding0 = embed(rgbs_resize_c)
+            assert rendered_embedding.ndim == 2  # [L,D]
+            assert target_embeddings.ndim == 3  # [N,L,D]
 
-                target_emb = target_embeddings[target_i, 0]
-                rendered_emb = rendered_embedding[0]
-                rendered_emb0 = rendered_embedding0[0]
+            # NOTE: Randomly sampling a target (run 031) is worse than sampling the same target as MSE (run 032)
+            target_i = i_train_map[img_i]
+            target_emb = target_embeddings[target_i, 0]
+            rendered_emb = rendered_embedding[0]
+            rendered_emb0 = rendered_embedding0[0]
 
-                consistency_loss, consistency_loss0 = [], []
-                if 'cosine_sim' in args.consistency_loss_comparison:
-                    consistency_loss.append(-torch.cosine_similarity(target_emb, rendered_emb, dim=-1))
-                    consistency_loss0.append(-torch.cosine_similarity(target_emb, rendered_emb0, dim=-1))
+            consistency_loss, consistency_loss0 = [], []
+            if 'cosine_sim' in args.consistency_loss_comparison:
+                consistency_loss.append(-torch.cosine_similarity(target_emb, rendered_emb, dim=-1))
+                consistency_loss0.append(-torch.cosine_similarity(target_emb, rendered_emb0, dim=-1))
 
-                if 'mse' in args.consistency_loss_comparison:
-                    consistency_loss.append(F.mse_loss(rendered_emb, target_emb))
-                    consistency_loss0.append(F.mse_loss(rendered_emb0, target_emb))
+            if 'mse' in args.consistency_loss_comparison:
+                consistency_loss.append(F.mse_loss(rendered_emb, target_emb))
+                consistency_loss0.append(F.mse_loss(rendered_emb0, target_emb))
 
-                if 'max_patch_match_alltargets' in args.consistency_loss_comparison:
-                    patch_sim = get_patch_similarity_matrix(rendered_embedding[1:], target_embeddings[:, 1:])  # [L-1,num_targ*(L-1)]
-                    max_patch_sim, _ = torch.max(patch_sim, dim=1)  # max across target patches
-                    consistency_loss.append(-torch.mean(max_patch_sim))  # mean across rendered patches
+            if 'max_patch_match_alltargets' in args.consistency_loss_comparison:
+                patch_sim = get_patch_similarity_matrix(rendered_embedding[1:], target_embeddings[:, 1:])  # [L-1,num_targ*(L-1)]
+                max_patch_sim, _ = torch.max(patch_sim, dim=1)  # max across target patches
+                consistency_loss.append(-torch.mean(max_patch_sim))  # mean across rendered patches
 
-                    patch_sim0 = get_patch_similarity_matrix(rendered_embedding0[1:], target_embeddings[:, 1:])
-                    max_patch_sim0, _ = torch.max(patch_sim0, dim=1)
-                    consistency_loss0.append(-torch.mean(max_patch_sim0))
+                patch_sim0 = get_patch_similarity_matrix(rendered_embedding0[1:], target_embeddings[:, 1:])
+                max_patch_sim0, _ = torch.max(patch_sim0, dim=1)
+                consistency_loss0.append(-torch.mean(max_patch_sim0))
 
-                if 'max_patch_match_sametarget' in args.consistency_loss_comparison:
-                    patch_sim = get_patch_similarity_matrix(
-                        rendered_embedding[1:], target_embeddings[target_i, 1:].unsqueeze(0))  # [L-1,L-1]
-                    max_patch_sim, _ = torch.max(patch_sim, dim=1)  # max across target patches
-                    consistency_loss.append(-torch.mean(max_patch_sim))  # mean across rendered patches
+            if 'max_patch_match_sametarget' in args.consistency_loss_comparison:
+                patch_sim = get_patch_similarity_matrix(
+                    rendered_embedding[1:], target_embeddings[target_i, 1:].unsqueeze(0))  # [L-1,L-1]
+                max_patch_sim, _ = torch.max(patch_sim, dim=1)  # max across target patches
+                consistency_loss.append(-torch.mean(max_patch_sim))  # mean across rendered patches
 
-                    patch_sim0 = get_patch_similarity_matrix(
-                        rendered_embedding0[1:], target_embeddings[target_i, 1:].unsqueeze(0))  # [L-1,L-1]
-                    max_patch_sim0, _ = torch.max(patch_sim0, dim=1)
-                    consistency_loss0.append(-torch.mean(max_patch_sim0))
+                patch_sim0 = get_patch_similarity_matrix(
+                    rendered_embedding0[1:], target_embeddings[target_i, 1:].unsqueeze(0))  # [L-1,L-1]
+                max_patch_sim0, _ = torch.max(patch_sim0, dim=1)
+                consistency_loss0.append(-torch.mean(max_patch_sim0))
 
-                consistency_loss = torch.mean(torch.stack(consistency_loss))
-                consistency_loss0 = torch.mean(torch.stack(consistency_loss0))
+            consistency_loss = torch.mean(torch.stack(consistency_loss))
+            consistency_loss0 = torch.mean(torch.stack(consistency_loss0))
 
             loss = (loss + consistency_loss * args.consistency_loss_lam +
                     consistency_loss0 * args.consistency_loss_lam0)
@@ -1286,7 +1264,6 @@ def train():
             rendered_features_resize_c = F.interpolate(rendered_features, (args.render_nH, args.render_nW), mode=args.feature_interp_mode)
             rendered_features_resize_c = rendered_features_resize_c.float()
 
-            # print('aligned_loss', rendered_features.dtype, rendered_features_resize_c.dtype, target_feature_samples.dtype, rendered_acc_map.dtype, rendered_acc0.dtype)
             aligned_loss = compute_aligned_loss(args,
                 rendered_features_resize_c[0:1],
                 target_feature_samples,  # [1, D, cnH, cnW]
@@ -1300,21 +1277,13 @@ def train():
             loss = (loss + aligned_loss * args.aligned_loss_lam +
                     aligned_loss0 * args.aligned_loss_lam0)
 
-        def log_discriminator_histograms(metrics, key, preds):
-            if isinstance(preds, list):
-                for disc_id, pred in enumerate(preds):
-                    metrics[f'{key}_D{disc_id}'] = make_wandb_histogram(pred)
-            else:
-                metrics[f'{key}_D0'] = make_wandb_histogram(preds)
-
         if args.patch_gan_loss and render_loss_iter:
             # Compute realism loss for NeRF training
             gan_networks.set_requires_grad([netD], False)
 
-            ## Flip fine network's rendering
+            # Flip fine network's rendering
             rgbs_G = torch.cat([rgbs[:1], rgbs[:1].flip(3)], dim=0)
             if rgbs_G.shape[2:] != (args.patch_gan_D_nH, args.patch_gan_D_nW):
-                assert False
                 rgbs_G = F.interpolate(rgbs_G, (args.patch_gan_D_nH, args.patch_gan_D_nW), mode=args.pixel_interp_mode)
             pred_fake = netD(rgbs_G * 2 - 1)
             if args.patch_gan_num_Ds > 1:
@@ -1327,7 +1296,24 @@ def train():
             metrics['train_patch_gan/G/loss_G'] = loss_G.item()
             log_discriminator_histograms(metrics, 'train_patch_gan/G/pred_fake', pred_fake)
 
-        loss.backward()  # TODO: do we need to set retain_graph=True?
+        if not args.no_mse:
+            # Standard NeRF MSE loss with subsampled rays
+            rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, rays=batch_rays,
+                                            verbose=i < 10, retraw=True,
+                                            **render_kwargs_train)
+            img_loss = img2mse(rgb, target_s)
+            trans = extras['raw'][...,-1]
+            loss = loss + img_loss
+            psnr = mse2psnr(img_loss)
+
+            if 'rgb0' in extras:
+                if i == start:
+                    print('Using auxilliary rgb0 mse loss')
+                img_loss0 = img2mse(extras['rgb0'], target_s)
+                loss = loss + img_loss0
+                psnr0 = mse2psnr(img_loss0)
+
+        loss.backward()
         optimizer.step()
 
         if args.patch_gan_loss and render_loss_iter:
@@ -1340,7 +1326,6 @@ def train():
                     rgbs_D = rgbs.detach()[:1]
                     rgbs_D = torch.cat([rgbs_D, rgbs_D.flip(3)], dim=0)
                     if rgbs_D.shape[2:] != (args.patch_gan_D_nH, args.patch_gan_D_nW):
-                        assert False
                         rgbs_D = F.interpolate(rgbs_D, (args.patch_gan_D_nH, args.patch_gan_D_nW), mode=args.pixel_interp_mode)
 
                     targets_D = targets[np.random.randint(len(targets))].unsqueeze(0)
@@ -1348,33 +1333,26 @@ def train():
                     if targets_D.shape[2:] != (args.patch_gan_D_nH, args.patch_gan_D_nW):
                         targets_D = F.interpolate(targets.detach(), (args.patch_gan_D_nH, args.patch_gan_D_nW), mode=args.pixel_interp_mode)
 
-                    all_D = torch.cat([rgbs_D, targets_D], dim=0)
-                pred_all = netD(all_D.detach() * 2 - 1)
-                if args.patch_gan_num_Ds > 1:
-                    pred_fake = [p[:rgbs_D.shape[0]] for p in pred_all]
-                    pred_real = [p[rgbs_D.shape[0]:] for p in pred_all]
-                    print('patch gan disc loss pred shapes', 'rgbs_D', rgbs_D.shape, 'pred_fake', len(pred_fake), list(map(lambda x: x.shape, pred_fake)), 'targets_D', targets_D.shape, 'pred_real', len(pred_real), list(map(lambda x: x.shape, pred_real)))
-                else:
-                    pred_fake, pred_real = pred_all[:rgbs_D.shape[0]], pred_all[rgbs_D.shape[0]:]
+                pred_fake = netD(rgbs_D.detach())
+                pred_real = netD(targets_D.detach())
 
                 loss_D_fake, _ = criterionGAN(pred_fake, False)
                 loss_D_real, _ = criterionGAN(pred_real, True)
                 loss_D = loss_D_fake + loss_D_real
 
-                if loss_D.requires_grad:
-                    loss_D.backward()
-                    if args.patch_gan_mode == 'wgangp':
-                        # gradient_penalty = gan_networks.cal_gradient_penalty(netD, rgbs_D, targets_D, lambda_gp=0.1, device=device)
-                        penalty_target_idx = np.random.choice(targets_D.shape[0], size=rgbs_D.shape[0], replace=False)
-                        gradient_penalty = discriminator_singan.calc_gradient_penalty(
-                            netD, fake_data=rgbs_D, real_data=targets_D[penalty_target_idx], LAMBDA=args.patch_wgan_lambda_gp, device=device)
-                        gradient_penalty.backward()
-                        loss_D += gradient_penalty
-                        metrics['train_patch_gan/D/gradient_penality'] = gradient_penalty
-                    else:
-                        if args.patch_gan_D_grad_clip > 0:
-                            nn.utils.clip_grad.clip_grad_norm_(netD.parameters(), max_norm=args.patch_gan_D_grad_clip)
-                    optimizer_D.step()
+                if args.patch_gan_mode == 'wgangp':
+                    optimizer_D.zero_grad()
+                    penalty_target_idx = np.random.choice(targets_D.shape[0], size=rgbs_D.shape[0], replace=False)
+                    gradient_penalty = gan_networks.cal_gradient_penalty(netD,
+                        fake_data=rgbs_D.detach(), real_data=targets_D[penalty_target_idx].detach(),
+                        lambda_gp=args.patch_wgan_lambda_gp, device=device)
+                    loss_D = loss_D + gradient_penalty
+                    metrics['train_patch_gan/D/gradient_penality'] = gradient_penalty.item()
+
+                if args.patch_gan_D_grad_clip > 0:
+                    nn.utils.clip_grad.clip_grad_norm_(netD.parameters(), max_norm=args.patch_gan_D_grad_clip)
+                loss_D.backward()
+                optimizer_D.step()
 
             metrics['train_patch_gan/D/rgbs_D'] = make_wandb_image(rgbs_D[0].permute(1,2,0), 'clip')  # fine network
             metrics['train_patch_gan/D/targets_D'] = make_wandb_image(targets_D[np.random.randint(len(targets_D))].permute(1,2,0), 'clip')
@@ -1384,16 +1362,17 @@ def train():
             log_discriminator_histograms(metrics, 'train_patch_gan/D/pred_fake', pred_fake)
             log_discriminator_histograms(metrics, 'train_patch_gan/D/pred_real', pred_real)
 
-        # NOTE: IMPORTANT!
+        # # NOTE: IMPORTANT!
         ###   update learning rate   ###
         decay_rate = 0.1
         decay_steps = args.lrate_decay * 1000
         new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
         for param_group in optimizer.param_groups:
             param_group['lr'] = new_lrate
-        new_lrate_D = args.patch_gan_lr * (decay_rate ** (global_step / decay_steps))
-        for param_group in optimizer_D.param_groups:
-            param_group['lr'] = new_lrate_D
+        if args.patch_gan_loss:
+            new_lrate_D = args.patch_gan_lr * (decay_rate ** (global_step / decay_steps))
+            for param_group in optimizer_D.param_groups:
+                param_group['lr'] = new_lrate_D
         #####           end            #####
 
         # Rest is logging
@@ -1482,7 +1461,6 @@ def train():
 
         if metrics:
             wandb.log(metrics, step=i)
-
 
         global_step += 1
 

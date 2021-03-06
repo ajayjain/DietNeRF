@@ -1,5 +1,32 @@
 # Semantically consistent radiance fields for few shot view synthesis
 
+## Things to explore
+
+**Improve quality**
+- Train a PatchGAN discriminator (in progress)
+  - Implemented:
+    - loop to estimate the discriminator [071]
+    - Gradient clipping [072]
+  - Replay buffer of fakes, update discriminator every iteration? or loop to estimate the generator
+  - Add a learning rate schedule
+  - Try vanilla and WGAN-GP losses
+  - Try the 128x128 discriminator
+  - Try smaller patch sizes (shallower discriminator). Check if its currently overfitting
+  - Scale inputs between -1, 1 rather than 0, 1
+  - Augment real samples with random lr flips
+  - Smaller batch size for real samples? Currently doing full batch
+  - Random crops so patches shift around
+    - Maybe render at 168x168 and random crop 128x128 for input to the discriminator
+  - Progressively train the discriminator somehow? with degraded real samples
+  - 2 discriminators as in BiCycleGAN
+  - Use an EMA of the discriminator weights for the generator's realism loss
+- Use a pre-trained BigGAN discriminator for an image quality loss
+- Use a pre-trained PatchGAN discriminator e.g. the patch-wise discriminator in GRF
+- Fine-tune a pre-trained PixelNeRF model on a scene, especially to perform better with 1 view
+
+**Computational efficiency**
+- Progressive training - render at low resolutions initially to speed up training
+
 ## Setup
 
 We will use the following folder structure:
