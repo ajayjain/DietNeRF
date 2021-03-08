@@ -434,12 +434,17 @@ def cal_gradient_penalty(netD, real_data, fake_data, device, type='mixed', const
             raise NotImplementedError('{} not implemented'.format(type))
         interpolatesv.requires_grad_(True)
         disc_interpolates = netD(interpolatesv)
-        gradients = torch.autograd.grad(outputs=disc_interpolates, inputs=interpolatesv,
-                                        grad_outputs=torch.ones(disc_interpolates.size()).to(device),
-                                        create_graph=True, retain_graph=True, only_inputs=True)
-        gradients = gradients[0].view(real_data.size(0), -1)  # flat the data
-        gradient_penalty = (((gradients + 1e-16).norm(2, dim=1) - constant) ** 2).mean() * lambda_gp        # added eps
-        return gradient_penalty
+        def _calc(disc_interp):
+            gradients = torch.autograd.grad(outputs=disc_interp, inputs=interpolatesv,
+                                            grad_outputs=torch.ones(disc_interp.size()).to(device),
+                                            create_graph=True, retain_graph=True, only_inputs=True)
+            gradients = gradients[0].view(real_data.size(0), -1)  # flat the data
+            gradient_penalty = (((gradients + 1e-16).norm(2, dim=1) - constant) ** 2).mean() * lambda_gp        # added eps
+            return gradient_penalty
+        if isinstance(disc_interpolates, list):
+            return sum(map(_calc, disc_interpolates))
+        else:
+            return _calc(disc_interpolates)
     else:
         return 0.0
 
