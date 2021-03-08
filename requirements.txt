@@ -10,3 +10,5 @@ opencv-python
 ftfy
 wandb
 regex
+timm
+fire

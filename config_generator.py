@@ -48,7 +48,7 @@ save_splits = True"""
             f.write(config)
         print("=============================")
 
-        command = f"PYTHONPATH=/data/ajay/clip/CLIP:$PYTHONPATH CUDA_VISIBLE_DEVICES={i} python run_nerf.py --config {out_path} &"
+        command = f"CUDA_VISIBLE_DEVICES={i} python run_nerf.py --config {out_path} &"
         commands.append(command)
 
     print("=========== COMMANDS")
