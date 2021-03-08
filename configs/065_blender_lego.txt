@@ -2,7 +2,6 @@
 #   - uses CLIP ViT for both consistency and alignment losses
 #   - use only up to the 5th layer of the ViT for the alignment loss to save memory
 #   - quarter the chunk size to save memory
-#   - checkpoint embedding to save memory
 expname = 065_blender_lego_ctr-clipvit_alignment-clipvit5-nomask-cosine_sim
 basedir = ./logs
 datadir = ./data/nerf_synthetic/lego
@@ -37,8 +36,8 @@ i_video = 6250
 pixel_interp_mode = bicubic
 feature_interp_mode = bilinear
 consistency_loss_interval = 10
-consistency_nH = 168
-consistency_nW = 168
+consistency_nH = 112
+consistency_nW = 112
 consistency_jitter_rays = False
 consistency_size = 224
 
