@@ -28,10 +28,13 @@ precrop_frac = 0.5
 half_res = True
 """
 
-def make_synthetic_scenes(start_id, max_train_views=-1):
+def make_synthetic_scenes(start_id, max_train_views=-1, consistency_loss=False):
     commands = []
     for i, scene in enumerate(SYNTHETIC_SCENES):
         expname = f"{start_id + i}_blender_{scene.name}_{max_train_views}views"
+        if consistency_loss:
+            expname += "_ctr"
+
         config = \
 f"""expname = {expname}
 datadir = {scene.datadir}
@@ -42,6 +45,34 @@ i_log_raw_hist = 50
 i_video = 6250
 save_splits = True
 checkpoint_rendering = True"""
+
+        if consistency_loss:
+            config = \
+f"""{config}
+## Computational options relevant for rendering
+pixel_interp_mode = bilinear
+feature_interp_mode = bilinear
+checkpoint_rendering = True
+i_log_ctr_img = 10
+
+## Shared rendering loss options
+render_loss_interval = 10
+render_nH = 168
+render_nW = 168
+render_jitter_rays = True
+render_poses = uniform
+render_theta_range = [-180, 180]
+render_phi_range = [-90, 0]
+render_radius_range = [3.5, 4.5]
+
+## Consistency loss options
+consistency_loss = consistent_with_target_rep
+consistency_loss_lam = 0.1
+consistency_loss_lam0 = 0.1
+consistency_model_type = clip_vit
+consistency_size = 224
+consistency_loss_comparison = cosine_sim"""
+
         out_path = f'configs/{expname}.txt'
         print("==== WRITING TO", out_path)
         print(config)
