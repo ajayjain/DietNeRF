@@ -971,22 +971,6 @@ def train():
     # Move testing data to GPU
     render_poses = torch.Tensor(render_poses).to(device)
 
-    # Save ground truth splits for visualization
-    if args.save_splits:
-        for idx, name in [(i_train, 'train'), (i_val, 'val'), (i_test, 'test')]:
-            savedir = os.path.join(basedir, expname, '{}set'.format(name))
-            os.makedirs(savedir, exist_ok=True)
-
-            torch.save(poses[idx], os.path.join(savedir, 'poses.pth'))
-            torch.save(idx, os.path.join(savedir, 'indices.pth'))
-            for i in idx:
-                rgb8 = to8b(images[i])
-                filename = os.path.join(savedir, '{:03d}.png'.format(i))
-                imageio.imwrite(filename, rgb8)
-
-            print(name, 'poses shape', poses[idx].shape, 'images shape', images[idx].shape)
-            print(f'Saved ground truth {name} set')
-
     # Short circuit if only rendering out from trained model
     if args.render_only:
         print('RENDER ONLY')
@@ -1007,6 +991,22 @@ def train():
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
             return
+
+    # Save ground truth splits for visualization
+    if args.save_splits:
+        for idx, name in [(i_train, 'train'), (i_val, 'val'), (i_test, 'test')]:
+            savedir = os.path.join(basedir, expname, '{}set'.format(name))
+            os.makedirs(savedir, exist_ok=True)
+
+            torch.save(poses[idx], os.path.join(savedir, 'poses.pth'))
+            torch.save(idx, os.path.join(savedir, 'indices.pth'))
+            for i in idx:
+                rgb8 = to8b(images[i])
+                filename = os.path.join(savedir, '{:03d}.png'.format(i))
+                imageio.imwrite(filename, rgb8)
+
+            print(name, 'poses shape', poses[idx].shape, 'images shape', images[idx].shape)
+            print(f'Saved ground truth {name} set')
 
     # Prepare raybatch tensor if batching random rays
     N_rand = args.N_rand
