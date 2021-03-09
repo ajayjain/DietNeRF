@@ -40,7 +40,8 @@ datadir = {scene.datadir}
 max_train_views = {max_train_views}
 i_log_raw_hist = 50
 i_video = 6250
-save_splits = True"""
+save_splits = True
+checkpoint_rendering = True"""
         out_path = f'configs/{expname}.txt'
         print("==== WRITING TO", out_path)
         print(config)
