@@ -13,7 +13,7 @@ to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 lpips_vgg = None
 
 @torch.no_grad()
-def get_perceptual_metrics(rgbs, gts, lpips_batch_size=32, device='cuda'):
+def get_perceptual_metrics(rgbs, gts, lpips_batch_size=8, device='cuda'):
     # rgbs and gts should be numpy arrays of the same shape
     mse = img2mse(torch.from_numpy(rgbs), torch.from_numpy(gts)).item()
 

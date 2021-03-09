@@ -995,7 +995,7 @@ def train():
                 # Compute metrics
                 mse, psnr, ssim, lpips = get_perceptual_metrics(rgbs, images, device=device)
 
-                metripath = os.path.join(testsavedir, 'test_metrics.json')
+                metricspath = os.path.join(testsavedir, 'test_metrics.json')
                 with open(metricspath, 'w') as test_metrics_f:
                     test_metrics = {
                         'mse': mse,
