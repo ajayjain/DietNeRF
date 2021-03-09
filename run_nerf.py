@@ -1,4 +1,5 @@
 import functools
+import json
 import os
 import time
 
@@ -989,6 +990,23 @@ def train():
             rgbs, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
+
+            if args.render_test:
+                # Compute metrics
+                mse, psnr, ssim, lpips = get_perceptual_metrics(rgbs, images, device=device)
+
+                metripath = os.path.join(testsavedir, 'test_metrics.json')
+                with open(metricspath, 'w') as test_metrics_f:
+                    test_metrics = {
+                        'mse': mse,
+                        'psnr': psnr,
+                        'ssim': ssim,
+                        'lpips': lpips,
+                    }
+                    print(args.expname, f'test metrics ({metricspath}):', test_metrics)
+                    test_metrics['args'] = vars(args)
+                    json.dump(test_metrics, test_metrics_f)
+                    wandb.save(metricspath)
 
             return
 

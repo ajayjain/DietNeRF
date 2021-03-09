@@ -1,12 +1,43 @@
+from lpips import LPIPS
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+from skimage.measure import compare_ssim, compare_psnr
 
 # Misc
 img2mse = lambda x, y : torch.mean((x - y) ** 2)
 mse2psnr = lambda x : -10. * torch.log(x) / torch.log(torch.Tensor([10.]))
 to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
+
+lpips_vgg = None
+
+@torch.no_grad()
+def get_perceptual_metrics(rgbs, gts, lpips_batch_size=32, device='cuda'):
+    # rgbs and gts should be numpy arrays of the same shape
+    mse = img2mse(torch.from_numpy(rgbs), torch.from_numpy(gts)).item()
+
+    # From pixelNeRF https://github.com/sxyu/pixel-nerf/blob/2929708e90b246dbd0329ce2a128ef381bd8c25d/eval/calc_metrics.py#L188
+    global lpips_vgg
+    ssim = [compare_ssim(rgb, gt, multichannel=True, data_range=1) for rgb, gt in zip(rgbs, gts)]
+    ssim = np.mean(ssim)
+    psnr = [compare_psnr(rgb, gt, data_range=1) for rgb, gt in zip(rgbs, gts)]
+    psnr = np.mean(psnr)
+
+    # From pixelNeRF https://github.com/sxyu/pixel-nerf/blob/2929708e90b246dbd0329ce2a128ef381bd8c25d/eval/calc_metrics.py#L238
+    if lpips_vgg is None:
+        lpips_vgg = LPIPS(net="vgg").to(device=device)
+    lpips_all = []
+    preds_spl = torch.split(torch.from_numpy(rgbs).permute(0,3,1,2).float(), lpips_batch_size, dim=0)
+    gts_spl = torch.split(torch.from_numpy(gts).permute(0,3,1,2).float(), lpips_batch_size, dim=0)
+    for predi, gti in zip(preds_spl, gts_spl):
+        lpips_i = lpips_vgg(predi.to(device=device), gti.to(device=device))
+        lpips_all.append(lpips_i)
+    lpips = torch.cat(lpips_all)
+    lpips = lpips.mean().item()
+
+    return mse, psnr, ssim, lpips
+
 
 class DenseLayer(nn.Linear):
     def __init__(self, in_dim: int, out_dim: int, activation: str = "relu", *args, **kwargs) -> None:
@@ -17,6 +48,7 @@ class DenseLayer(nn.Linear):
         torch.nn.init.xavier_uniform_(self.weight, gain=torch.nn.init.calculate_gain(self.activation))
         if self.bias is not None:
             torch.nn.init.zeros_(self.bias)
+
 
 # Positional encoding (section 5.1)
 class Embedder:
