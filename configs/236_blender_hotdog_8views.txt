@@ -19,3 +19,4 @@ i_log_raw_hist = 50
 i_video = 6250
 save_splits = True
 checkpoint_rendering = True
+render_autocast = False
