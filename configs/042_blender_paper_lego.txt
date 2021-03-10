@@ -31,7 +31,7 @@ consistency_nW = 168
 consistency_jitter_rays = True
 consistency_model_type = clip_vit
 
-consistency_reembed_target = False
+# consistency_reembed_target = False  ## NOTE 3/9/21: removed argument, default to False
 consistency_poses = uniform
 consistency_theta_range = [-180, 180]
 consistency_phi_range = [-90, 0]
