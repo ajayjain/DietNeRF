@@ -83,7 +83,7 @@ def batchify_rays(rays_flat, chunk=1024*32, keep_keys=None, **kwargs):
 def render(H, W, focal, chunk=1024*32, rays=None, c2w=None, ndc=True,
                   near=0., far=1.,
                   use_viewdirs=False, c2w_staticcam=None,
-                  keep_keys=None,
+                  keep_keys=None, autocast=False,
                   **kwargs):
     """Render rays
     Args:
@@ -137,18 +137,19 @@ def render(H, W, focal, chunk=1024*32, rays=None, c2w=None, ndc=True,
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1)
 
-    # Render and reshape
-    all_ret = batchify_rays(rays, chunk, keep_keys=keep_keys, **kwargs)
-    for k in all_ret:
-        k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
-        all_ret[k] = torch.reshape(all_ret[k], k_sh)
+    with torch.cuda.amp.autocast(enabled=autocast):
+        # Render and reshape
+        all_ret = batchify_rays(rays, chunk, keep_keys=keep_keys, **kwargs)
+        for k in all_ret:
+            k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
+            all_ret[k] = torch.reshape(all_ret[k], k_sh)
 
-    k_extract = ['rgb_map', 'disp_map', 'acc_map']
-    if keep_keys:
-        k_extract = [k for k in k_extract if k in keep_keys]
-    ret_list = [all_ret[k] for k in k_extract]
-    ret_dict = {k : all_ret[k] for k in all_ret}
-    return ret_list + [ret_dict]
+        k_extract = ['rgb_map', 'disp_map', 'acc_map']
+        if keep_keys:
+            k_extract = [k for k in k_extract if k in keep_keys]
+        ret_list = [all_ret[k] for k in k_extract]
+        ret_dict = {k : all_ret[k] for k in all_ret}
+        return ret_list + [ret_dict]
 
 
 def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
@@ -968,6 +969,8 @@ def train():
     }
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
+    render_kwargs_train['autocast'] = args.render_autocast
+    render_kwargs_test['autocast'] = args.render_autocast
 
     # Move testing data to GPU
     render_poses = torch.Tensor(render_poses).to(device)
@@ -1166,13 +1169,12 @@ def train():
                     rays = get_rays(H, W, focal, c2w=pose, nH=args.render_nH, nW=args.render_nW,
                                     jitter=args.render_jitter_rays)
 
-                with torch.cuda.amp.autocast(enabled=args.render_autocast):
-                    extras = render(H, W, focal, chunk=args.chunk, rays=rays,
-                                    keep_keys=consistency_keep_keys,
-                                    **render_kwargs_train)[-1]
-                    # rgb0 is the rendering from the coarse network, while rgb_map uses the fine network
-                    rgbs = torch.stack([extras['rgb_map'], extras['rgb0']], dim=0)
-                    rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
+                extras = render(H, W, focal, chunk=args.chunk, rays=rays,
+                                keep_keys=consistency_keep_keys,
+                                **render_kwargs_train)[-1]
+                # rgb0 is the rendering from the coarse network, while rgb_map uses the fine network
+                rgbs = torch.stack([extras['rgb_map'], extras['rgb0']], dim=0)
+                rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
 
                 if i == 0:
                     print('rendering losses rendered rgb image shape:', rgbs.shape)
