@@ -8,7 +8,6 @@
 # CUDA_VISIBLE_DEVICES=2 python run_nerf.py --config configs/252_blender_ficus_8views_ctr.txt &
 # CUDA_VISIBLE_DEVICES=4 python run_nerf.py --config configs/254_blender_mic_8views_ctr.txt &
 
-# Need to run
 # CUDA_VISIBLE_DEVICES=5 python run_nerf.py --config configs/255_blender_ship_8views_ctr.txt &
 
 # Skip (using earlier run 042 for lego)

@@ -83,7 +83,7 @@ def batchify_rays(rays_flat, chunk=1024*32, keep_keys=None, **kwargs):
 def render(H, W, focal, chunk=1024*32, rays=None, c2w=None, ndc=True,
                   near=0., far=1.,
                   use_viewdirs=False, c2w_staticcam=None,
-                  keep_keys=None, autocast=False,
+                  keep_keys=None,
                   **kwargs):
     """Render rays
     Args:
@@ -137,19 +137,18 @@ def render(H, W, focal, chunk=1024*32, rays=None, c2w=None, ndc=True,
     if use_viewdirs:
         rays = torch.cat([rays, viewdirs], -1)
 
-    with torch.cuda.amp.autocast(enabled=autocast):
-        # Render and reshape
-        all_ret = batchify_rays(rays, chunk, keep_keys=keep_keys, **kwargs)
-        for k in all_ret:
-            k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
-            all_ret[k] = torch.reshape(all_ret[k], k_sh)
+    # Render and reshape
+    all_ret = batchify_rays(rays, chunk, keep_keys=keep_keys, **kwargs)
+    for k in all_ret:
+        k_sh = list(sh[:-1]) + list(all_ret[k].shape[1:])
+        all_ret[k] = torch.reshape(all_ret[k], k_sh)
 
-        k_extract = ['rgb_map', 'disp_map', 'acc_map']
-        if keep_keys:
-            k_extract = [k for k in k_extract if k in keep_keys]
-        ret_list = [all_ret[k] for k in k_extract]
-        ret_dict = {k : all_ret[k] for k in all_ret}
-        return ret_list + [ret_dict]
+    k_extract = ['rgb_map', 'disp_map', 'acc_map']
+    if keep_keys:
+        k_extract = [k for k in k_extract if k in keep_keys]
+    ret_list = [all_ret[k] for k in k_extract]
+    ret_dict = {k : all_ret[k] for k in all_ret}
+    return ret_list + [ret_dict]
 
 
 def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=None, render_factor=0):
@@ -226,6 +225,7 @@ def create_nerf(args):
 
     # Create optimizer
     optimizer = torch.optim.Adam(params=grad_vars, lr=args.lrate, betas=(0.9, 0.999))
+    scaler = torch.cuda.amp.GradScaler(enabled=args.render_autocast)
 
     start = 0
     basedir = args.basedir
@@ -278,7 +278,7 @@ def create_nerf(args):
     render_kwargs_test['perturb'] = False
     render_kwargs_test['raw_noise_std'] = 0.
 
-    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer
+    return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, scaler
 
 
 def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
@@ -841,10 +841,6 @@ def train():
     wandb.run.save()
     wandb.config.update(args)
 
-    # Re-seed
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-
     # Multi-GPU
     args.n_gpus = torch.cuda.device_count()
     print(f"Using {args.n_gpus} GPU(s).")
@@ -948,8 +944,12 @@ def train():
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
 
+    # Re-seed
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
     # Create nerf model
-    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer = create_nerf(args)
+    render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, scaler = create_nerf(args)
     global_step = start
     network_fn = render_kwargs_train['network_fn']
     network_fine = render_kwargs_train['network_fine']
@@ -969,8 +969,6 @@ def train():
     }
     render_kwargs_train.update(bds_dict)
     render_kwargs_test.update(bds_dict)
-    render_kwargs_train['autocast'] = args.render_autocast
-    render_kwargs_test['autocast'] = args.render_autocast
 
     # Move testing data to GPU
     render_poses = torch.Tensor(render_poses).to(device)
@@ -1169,12 +1167,13 @@ def train():
                     rays = get_rays(H, W, focal, c2w=pose, nH=args.render_nH, nW=args.render_nW,
                                     jitter=args.render_jitter_rays)
 
-                extras = render(H, W, focal, chunk=args.chunk, rays=rays,
-                                keep_keys=consistency_keep_keys,
-                                **render_kwargs_train)[-1]
-                # rgb0 is the rendering from the coarse network, while rgb_map uses the fine network
-                rgbs = torch.stack([extras['rgb_map'], extras['rgb0']], dim=0)
-                rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
+                with torch.cuda.amp.autocast(enabled=args.render_autocast):
+                    extras = render(H, W, focal, chunk=args.chunk, rays=rays,
+                                    keep_keys=consistency_keep_keys,
+                                    **render_kwargs_train)[-1]
+                    # rgb0 is the rendering from the coarse network, while rgb_map uses the fine network
+                    rgbs = torch.stack([extras['rgb_map'], extras['rgb0']], dim=0)
+                    rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
 
                 if i == 0:
                     print('rendering losses rendered rgb image shape:', rgbs.shape)
@@ -1333,8 +1332,9 @@ def train():
                 loss = loss + img_loss0
                 psnr0 = mse2psnr(img_loss0)
 
-        loss.backward()
-        optimizer.step()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         if args.patch_gan_loss and render_loss_iter:
             # Compute loss for discriminator training
@@ -1361,7 +1361,6 @@ def train():
                 loss_D = loss_D_fake + loss_D_real
 
                 if args.patch_gan_mode == 'wgangp':
-                    optimizer_D.zero_grad()
                     penalty_target_idx = np.random.choice(targets_D.shape[0], size=rgbs_D.shape[0], replace=False)
                     gradient_penalty = gan_networks.cal_gradient_penalty(netD,
                         fake_data=rgbs_D.detach(), real_data=targets_D[penalty_target_idx].detach(),
@@ -1369,10 +1368,14 @@ def train():
                     loss_D = loss_D + gradient_penalty
                     metrics['train_patch_gan/D/gradient_penality'] = gradient_penalty.item()
 
+                scaler.scale(loss_D).backward()
+                scaler.step(optimizer_D)
+
                 if args.patch_gan_D_grad_clip > 0:
+                    scaler.unscale_(optimizer_D)
                     nn.utils.clip_grad.clip_grad_norm_(netD.parameters(), max_norm=args.patch_gan_D_grad_clip)
-                loss_D.backward()
-                optimizer_D.step()
+
+                scaler.update()
 
             metrics['train_patch_gan/D/rgbs_D'] = make_wandb_image(rgbs_D[0].permute(1,2,0), 'clip')  # fine network
             metrics['train_patch_gan/D/targets_D'] = make_wandb_image(targets_D[np.random.randint(len(targets_D))].permute(1,2,0), 'clip')
