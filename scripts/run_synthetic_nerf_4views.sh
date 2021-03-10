@@ -9,7 +9,7 @@
 
 # CUDA_VISIBLE_DEVICES=5 python run_nerf.py --config configs/226_blender_hotdog_4views.txt &
 # Need to run below
-CUDA_VISIBLE_DEVICES=1,2 python run_nerf.py --config configs/227_blender_materials_4views.txt &
+CUDA_VISIBLE_DEVICES=0,1 python run_nerf.py --config configs/227_blender_materials_4views.txt &
 
 
 ## Test
