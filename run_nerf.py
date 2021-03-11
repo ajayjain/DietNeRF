@@ -703,6 +703,7 @@ def config_parser():
                         help='number of steps to train on central crops')
     parser.add_argument("--precrop_frac", type=float,
                         default=.5, help='fraction of img taken for central crops') 
+    parser.add_argument("--N_iters", type=int, default=200000)
 
     # dataset options
     parser.add_argument("--dataset_type", type=str, default='llff', 
@@ -738,9 +739,6 @@ def config_parser():
                         help='frequency of metric logging')
     parser.add_argument("--i_log_raw_hist",   type=int, default=2, 
                         help='frequency of logging histogram of raw network outputs')
-    parser.add_argument("--i_log_rendered_img", "--i_log_ctr_img",
-                        type=int, default=100, 
-                        help='frequency of train rendering logging')
     parser.add_argument("--i_print",   type=int, default=100, 
                         help='frequency of console printout')
     parser.add_argument("--i_img",     type=int, default=500, 
@@ -760,6 +758,8 @@ def config_parser():
     # Options for rendering shared between different losses
     parser.add_argument("--render_loss_interval", "--consistency_loss_interval",
         type=float, default=1)
+    parser.add_argument("--render_increase_interval_every", type=int, default=0)
+    parser.add_argument("--render_increase_interval_delta", type=int, default=0)
     parser.add_argument("--render_autocast", action='store_true')
     parser.add_argument("--render_poses", "--consistency_poses",
         type=str, choices=['loaded', 'interpolate_train_all', 'uniform'], default='loaded')
@@ -1065,13 +1065,13 @@ def train():
         # i_batch = 0
 
     # Move training data to GPU
-    images = torch.Tensor(images).to(device)
-    poses = torch.Tensor(poses).to(device)
+    images = torch.Tensor(images)
+    poses = torch.Tensor(poses)
     # if use_batching:
     #     rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
-    N_iters = 200000 + 1
+    N_iters = args.N_iters + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -1081,7 +1081,8 @@ def train():
     any_rendered_loss = (calc_ctr_loss or args.aligned_loss or args.patch_gan_loss)
     if any_rendered_loss:
         with torch.no_grad():
-            targets = images[i_train].permute(0, 3, 1, 2)
+            targets = images[i_train].permute(0, 3, 1, 2).to(device)
+        render_loss_interval = args.render_loss_interval
 
     # Embed training images for consistency loss
     if calc_ctr_loss:
@@ -1138,8 +1139,8 @@ def train():
                 batch_rays.append(rays_pose)
                 target_s_pose = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
                 target_s.append(target_s_pose)
-            batch_rays = torch.cat(batch_rays, dim=1)  # (2, N_rand, 3)
-            target_s = torch.cat(target_s, dim=0)  # (N_rand, 3)
+            batch_rays = torch.cat(batch_rays, dim=1).to(device)  # (2, N_rand, 3)
+            target_s = torch.cat(target_s, dim=0).to(device)  # (N_rand, 3)
 
             # Random over all images
             # NOTE: this seems to lead to zero gradients for the fine network
@@ -1166,11 +1167,19 @@ def train():
             rays_o, rays_d = get_rays(H, W, focal, torch.Tensor(pose))  # (H, W, 3), (H, W, 3)
             batch_rays, select_coords = sample_rays(H, W, rays_o, rays_d, N_rand=N_rand,
                 i=i, start=start, precrop_iters=args.precrop_iters, precrop_frac=args.precrop_frac)
+            batch_rays = batch_rays.to(device)
             target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+            target_s = target_s.to(device)
 
         # Representational consistency loss with rendered image
-        render_loss_iter = i % args.render_loss_interval == 0
-        if (calc_ctr_loss or args.aligned_loss or args.patch_gan_loss) and render_loss_iter:
+        if any_rendered_loss:
+            metrics['train_ctr/render_loss_interval'] = render_loss_interval
+            render_loss_iter = i % render_loss_interval == 0
+            if args.render_increase_interval_every > 0 and i%args.render_increase_interval_every == 0:
+                # Reduce frequency of rendering losses
+                render_loss_interval += args.render_increase_interval_delta
+
+        if any_rendered_loss and render_loss_iter:
             with torch.no_grad():
                 # Render from a random viewpoint
                 if args.render_poses == 'loaded':
@@ -1197,7 +1206,8 @@ def train():
                                 jitter=args.render_jitter_rays)
 
             with torch.cuda.amp.autocast(enabled=args.render_autocast):
-                extras = render(H, W, focal, chunk=args.chunk, rays=rays,
+                extras = render(H, W, focal, chunk=args.chunk,
+                                rays=(rays[0].to(device), rays[1].to(device)),
                                 keep_keys=consistency_keep_keys,
                                 **render_kwargs_train)[-1]
                 # rgb0 is the rendering from the coarse network, while rgb_map uses the fine network
@@ -1211,7 +1221,7 @@ def train():
                 # TODO: support sampling nearby targets
                 assert args.no_batching, 'can only warp to one target pose'
                 align_target_i = img_i
-                align_target_pose = poses[align_target_i, :3,:4]
+                align_target_pose = poses[align_target_i, :3,:4].to(device)
 
                 # Create world to target camera trasformation
                 w2c = c2w_to_w2c(align_target_pose)
@@ -1241,10 +1251,11 @@ def train():
                 rendered_acc_map = extras['acc_map']
                 rendered_acc0 = extras['acc0']
 
-            if i%args.i_log_rendered_img==0:
+                # Log rendered images
                 metrics['train_ctr/rgb'] = make_wandb_image(extras['rgb_map'], 'clip')
                 metrics['train_ctr/rgb0'] = make_wandb_image(extras['rgb0'], 'clip')
 
+                # Log rendered features and warped target features
                 if args.aligned_loss:
                     metrics['train_aligned/target_feature'] = make_wandb_image(targets_features_resize_full[i_train_map[align_target_i]][...,None].mean(0))
                     metrics['train_aligned/target_feature_samples'] = make_wandb_image(target_feature_samples[0,...,None].mean(0))
