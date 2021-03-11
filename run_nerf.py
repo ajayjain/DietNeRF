@@ -266,6 +266,7 @@ def create_nerf(args):
         'use_viewdirs' : args.use_viewdirs,
         'white_bkgd' : args.white_bkgd,
         'raw_noise_std' : args.raw_noise_std,
+        'alpha_act_fn' : F.softplus if args.use_softplus_alpha else F.relu
     }
 
     # NDC only good for LLFF-style forward facing data
@@ -281,7 +282,7 @@ def create_nerf(args):
     return render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, scaler
 
 
-def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False):
+def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=False, alpha_act_fn=F.relu):
     """Transforms model's predictions to semantically meaningful values.
     Args:
         raw: [num_rays, num_samples along ray, 4]. Prediction from model.
@@ -294,7 +295,7 @@ def raw2outputs(raw, z_vals, rays_d, raw_noise_std=0, white_bkgd=False, pytest=F
         weights: [num_rays, num_samples]. Weights assigned to each sampled color.
         depth_map: [num_rays]. Estimated distance to object.
     """
-    raw2alpha = lambda raw, dists, act_fn=F.relu: 1.-torch.exp(-act_fn(raw)*dists)
+    raw2alpha = lambda raw, dists: 1.-torch.exp(-alpha_act_fn(raw)*dists)
 
     dists = z_vals[...,1:] - z_vals[...,:-1]
     dists = torch.cat([dists, torch.Tensor([1e10]).expand(dists[...,:1].shape)], -1)  # [N_rays, N_samples]
@@ -338,7 +339,8 @@ def render_rays(ray_batch,
                 network_fine=None,
                 white_bkgd=False,
                 raw_noise_std=0.,
-                pytest=False):
+                pytest=False,
+                alpha_act_fn=F.relu):
     """Volumetric rendering.
     Args:
       ray_batch: array of shape [batch_size, ...]. All information necessary
@@ -403,7 +405,7 @@ def render_rays(ray_batch,
 
 
     raw = network_query_fn(pts, viewdirs, network_fn)
-    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+    rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, alpha_act_fn=alpha_act_fn)
 
     if N_importance > 0:
         pts0, raw0, rgb_map_0, disp_map_0, acc_map_0, weights0 = pts, raw, rgb_map, disp_map, acc_map, weights
@@ -418,7 +420,7 @@ def render_rays(ray_batch,
         run_fn = network_fn if network_fine is None else network_fine
         raw = network_query_fn(pts, viewdirs, run_fn)
 
-        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest)
+        rgb_map, disp_map, acc_map, weights, depth_map = raw2outputs(raw, z_vals, rays_d, raw_noise_std, white_bkgd, pytest=pytest, alpha_act_fn=alpha_act_fn)
 
     ret = {'rgb_map' : rgb_map}
     ret['disp_map'] = disp_map
@@ -668,6 +670,8 @@ def config_parser():
     parser.add_argument("--ft_path", type=str, default=None, 
                         help='specific weights npy file to reload for coarse network')
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--use_softplus_alpha", action='store_true',
+                        help='use a softplus activation on predicted alphas rather than relu')
 
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64, 
@@ -783,6 +787,9 @@ def config_parser():
     parser.add_argument("--consistency_loss", type=str, default='none', choices=['none', 'consistent_with_target_rep'])
     parser.add_argument("--consistency_loss_comparison", type=str, default=['cosine_sim'], nargs='+', choices=[
         'cosine_sim', 'mse', 'max_patch_match_sametarget', 'max_patch_match_alltargets'])
+    parser.add_argument("--consistency_loss_sampling", type=str, default='single_random', choices=[
+        'single_random', 'distance_weighted'])
+    parser.add_argument("--consistency_loss_sampling_temp", type=float, default=1.)
     parser.add_argument("--consistency_loss_lam", type=float, default=0.2,
                         help="weight for the fine network's semantic consistency loss")
     parser.add_argument("--consistency_loss_lam0", type=float, default=0.2,
@@ -1031,26 +1038,37 @@ def train():
     N_rand = args.N_rand
     use_batching = not args.no_batching
     if use_batching:
-        # For random ray batching
+        assert not args.render_jitter_rays
         print('get rays')
-        rays = np.stack([get_rays_np(H, W, focal, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
-        print('done, concats')
-        rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
-        rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
-        rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
-        rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
-        rays_rgb = rays_rgb.astype(np.float32)
-        print('shuffle rays')
-        np.random.shuffle(rays_rgb)
 
-        print('done')
-        i_batch = 0
+        # For random ray batching, equal number of rays per pose
+        rays_rgb_o = []
+        rays_rgb_d = []
+        for p in poses[i_train,:3,:4]:
+            rays_o, rays_d = get_rays(H, W, focal, torch.Tensor(p))  # (H, W, 3), (H, W, 3)
+            rays_rgb_o.append(rays_o)
+            rays_rgb_d.append(rays_d)
+        N_rand_per_view = N_rand // len(i_train)
+
+        # For random ray batching
+        # rays = np.stack([get_rays_np(H, W, focal, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
+        # print('done, concats')
+        # rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
+        # rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
+        # rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
+        # rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
+        # rays_rgb = rays_rgb.astype(np.float32)
+        # print('shuffle rays')
+        # np.random.shuffle(rays_rgb)
+
+        # print('done')
+        # i_batch = 0
 
     # Move training data to GPU
     images = torch.Tensor(images).to(device)
     poses = torch.Tensor(poses).to(device)
-    if use_batching:
-        rays_rgb = torch.Tensor(rays_rgb).to(device)
+    # if use_batching:
+    #     rays_rgb = torch.Tensor(rays_rgb).to(device)
 
 
     N_iters = 200000 + 1
@@ -1112,20 +1130,31 @@ def train():
 
         # Sample random ray batch
         if use_batching:
-            assert args.consistency_loss == 'none'
+            # Select the same number of rays for each view
+            batch_rays, target_s = [], []
+            for target, rays_o, rays_d in zip(images[i_train], rays_rgb_o, rays_rgb_d):
+                rays_pose, select_coords = sample_rays(H, W, rays_o, rays_d, N_rand=N_rand_per_view,
+                    i=i, start=start, precrop_iters=args.precrop_iters, precrop_frac=args.precrop_frac)
+                batch_rays.append(rays_pose)
+                target_s_pose = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
+                target_s.append(target_s_pose)
+            batch_rays = torch.cat(batch_rays, dim=1)  # (2, N_rand, 3)
+            target_s = torch.cat(target_s, dim=0)  # (N_rand, 3)
 
             # Random over all images
-            batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
-            batch = torch.transpose(batch, 0, 1)
-            batch_rays, target_s = batch[:2], batch[2]
+            # NOTE: this seems to lead to zero gradients for the fine network
+            # for NeRF's blender realistic synthetic scenes. Should use this
+            # for forward facing llff data, however.
+            # batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
+            # batch = torch.Tensor(batch).to(device)
+            # batch = torch.transpose(batch, 0, 1)
+            # batch_rays, target_s = batch[:2], batch[2]
 
-            i_batch += N_rand
-            if i_batch >= rays_rgb.shape[0]:
-                print("Shuffle data after an epoch!")
-                rand_idx = torch.randperm(rays_rgb.shape[0])
-                rays_rgb = rays_rgb[rand_idx]
-                i_batch = 0
-
+            # i_batch += N_rand
+            # if i_batch >= rays_rgb.shape[0]:
+            #     print("Shuffle data after an epoch!")
+            #     np.random.shuffle(rays_rgb)
+            #     i_batch = 0
         else:
             assert N_rand is not None
 
@@ -1139,90 +1168,90 @@ def train():
                 i=i, start=start, precrop_iters=args.precrop_iters, precrop_frac=args.precrop_frac)
             target_s = target[select_coords[:, 0], select_coords[:, 1]]  # (N_rand, 3)
 
-            # Representational consistency loss with rendered image
-            render_loss_iter = i % args.render_loss_interval == 0
-            if (calc_ctr_loss or args.aligned_loss or args.patch_gan_loss) and render_loss_iter:
-                with torch.no_grad():
-                    # Render from a random viewpoint
-                    if args.render_poses == 'loaded':
-                        poses_i = np.random.choice(i_train_poses)
-                        pose = poses[poses_i, :3, :4]
-                    elif args.render_poses == 'interpolate_train_all':
-                        assert len(i_train_poses) >= 3
-                        poses_i = np.random.choice(i_train_poses, size=3, replace=False)
-                        pose1, pose2, pose3 = poses[poses_i, :3, :4].cpu()
-                        s12, s3 = np.random.uniform(*args.render_poses_interpolate_range, size=2)
-                        pose = geometry.interp3(pose1, pose2, pose3, s12, s3)
-                    elif args.render_poses == 'uniform':
-                        assert args.dataset_type == 'blender'
-                        pose = pose_spherical_uniform(args.render_theta_range, args.render_phi_range, args.render_radius_range)
-                        pose = pose[:3, :4]
+        # Representational consistency loss with rendered image
+        render_loss_iter = i % args.render_loss_interval == 0
+        if (calc_ctr_loss or args.aligned_loss or args.patch_gan_loss) and render_loss_iter:
+            with torch.no_grad():
+                # Render from a random viewpoint
+                if args.render_poses == 'loaded':
+                    poses_i = np.random.choice(i_train_poses)
+                    pose = poses[poses_i, :3, :4]
+                elif args.render_poses == 'interpolate_train_all':
+                    assert len(i_train_poses) >= 3
+                    poses_i = np.random.choice(i_train_poses, size=3, replace=False)
+                    pose1, pose2, pose3 = poses[poses_i, :3, :4].cpu()
+                    s12, s3 = np.random.uniform(*args.render_poses_interpolate_range, size=2)
+                    pose = geometry.interp3(pose1, pose2, pose3, s12, s3)
+                elif args.render_poses == 'uniform':
+                    assert args.dataset_type == 'blender'
+                    pose = pose_spherical_uniform(args.render_theta_range, args.render_phi_range, args.render_radius_range)
+                    pose = pose[:3, :4]
 
-                    print('Sampled pose:', Rotation.from_matrix(pose[:, :3].cpu()).as_rotvec(), 'origin:', pose[:, 3])
+                print('Sampled pose:', Rotation.from_matrix(pose[:, :3].cpu()).as_rotvec(), 'origin:', pose[:, 3])
 
-                    if args.render_poses_translation_jitter_sigma > 0:
-                        pose[:, -1] = pose[:, -1] + torch.randn(3, device=pose.device) * args.render_poses_translation_jitter_sigma
+                if args.render_poses_translation_jitter_sigma > 0:
+                    pose[:, -1] = pose[:, -1] + torch.randn(3, device=pose.device) * args.render_poses_translation_jitter_sigma
 
-                    # TODO: something strange with pts_W in get_rays when 224 nH
-                    rays = get_rays(H, W, focal, c2w=pose, nH=args.render_nH, nW=args.render_nW,
-                                    jitter=args.render_jitter_rays)
+                # TODO: something strange with pts_W in get_rays when 224 nH
+                rays = get_rays(H, W, focal, c2w=pose, nH=args.render_nH, nW=args.render_nW,
+                                jitter=args.render_jitter_rays)
 
-                with torch.cuda.amp.autocast(enabled=args.render_autocast):
-                    extras = render(H, W, focal, chunk=args.chunk, rays=rays,
-                                    keep_keys=consistency_keep_keys,
-                                    **render_kwargs_train)[-1]
-                    # rgb0 is the rendering from the coarse network, while rgb_map uses the fine network
-                    rgbs = torch.stack([extras['rgb_map'], extras['rgb0']], dim=0)
-                    rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
+            with torch.cuda.amp.autocast(enabled=args.render_autocast):
+                extras = render(H, W, focal, chunk=args.chunk, rays=rays,
+                                keep_keys=consistency_keep_keys,
+                                **render_kwargs_train)[-1]
+                # rgb0 is the rendering from the coarse network, while rgb_map uses the fine network
+                rgbs = torch.stack([extras['rgb_map'], extras['rgb0']], dim=0)
+                rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
 
-                if i == 0:
-                    print('rendering losses rendered rgb image shape:', rgbs.shape)
+            if i == 0:
+                print('rendering losses rendered rgb image shape:', rgbs.shape)
+
+            if args.aligned_loss:
+                # TODO: support sampling nearby targets
+                assert args.no_batching, 'can only warp to one target pose'
+                align_target_i = img_i
+                align_target_pose = poses[align_target_i, :3,:4]
+
+                # Create world to target camera trasformation
+                w2c = c2w_to_w2c(align_target_pose)
+
+                # Transform rendered rays
+                _, norm_uv = run_checkpoint(world_to_image, extras['pts'], w2c, H, W, focal, principal_point)
+                _, norm_uv0 = run_checkpoint(world_to_image, extras['pts0'], w2c, H, W, focal, principal_point)
+
+                # Embed rendered images into spatial features
+                rgbs_resize_c = F.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
+                rendered_features = embed_spatial(rgbs_resize_c)  # [2, D, fH, fW] = [2, 256, 56, 56] for CLIP RN50
+                
+                _resample = functools.partial(resample_features, feature_interp_mode=args.feature_interp_mode)
+                target_feature_samples = run_checkpoint(_resample,
+                    targets_features_resize_full[i_train_map[align_target_i]],
+                    norm_uv,
+                    extras['weights'],
+                )
+
+                target_feature_samples0 = run_checkpoint(_resample,
+                    targets_features_resize_full[i_train_map[align_target_i]],
+                    norm_uv0,
+                    extras['weights0'],
+                )
+
+                # Save acc map for loss calculation
+                rendered_acc_map = extras['acc_map']
+                rendered_acc0 = extras['acc0']
+
+            if i%args.i_log_rendered_img==0:
+                metrics['train_ctr/rgb'] = make_wandb_image(extras['rgb_map'], 'clip')
+                metrics['train_ctr/rgb0'] = make_wandb_image(extras['rgb0'], 'clip')
 
                 if args.aligned_loss:
-                    # TODO: support sampling nearby targets
-                    align_target_i = img_i
-                    align_target_pose = poses[align_target_i, :3,:4]
-
-                    # Create world to target camera trasformation
-                    w2c = c2w_to_w2c(align_target_pose)
-
-                    # Transform rendered rays
-                    _, norm_uv = run_checkpoint(world_to_image, extras['pts'], w2c, H, W, focal, principal_point)
-                    _, norm_uv0 = run_checkpoint(world_to_image, extras['pts0'], w2c, H, W, focal, principal_point)
-
-                    # Embed rendered images into spatial features
-                    rgbs_resize_c = F.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
-                    rendered_features = embed_spatial(rgbs_resize_c)  # [2, D, fH, fW] = [2, 256, 56, 56] for CLIP RN50
-                    
-                    _resample = functools.partial(resample_features, feature_interp_mode=args.feature_interp_mode)
-                    target_feature_samples = run_checkpoint(_resample,
-                        targets_features_resize_full[i_train_map[align_target_i]],
-                        norm_uv,
-                        extras['weights'],
-                    )
-
-                    target_feature_samples0 = run_checkpoint(_resample,
-                        targets_features_resize_full[i_train_map[align_target_i]],
-                        norm_uv0,
-                        extras['weights0'],
-                    )
-
-                    # Save acc map for loss calculation
-                    rendered_acc_map = extras['acc_map']
-                    rendered_acc0 = extras['acc0']
-
-                if i%args.i_log_rendered_img==0:
-                    metrics['train_ctr/target'] = make_wandb_image(target, 'clip')
-                    metrics['train_ctr/rgb'] = make_wandb_image(extras['rgb_map'], 'clip')
-                    metrics['train_ctr/rgb0'] = make_wandb_image(extras['rgb0'], 'clip')
-
-                    if args.aligned_loss:
-                        metrics['train_aligned/target_feature'] = make_wandb_image(targets_features_resize_full[i_train_map[align_target_i]][...,None].mean(0))
-                        metrics['train_aligned/target_feature_samples'] = make_wandb_image(target_feature_samples[0,...,None].mean(0))
-                        metrics['train_aligned/rendered_features'] = make_wandb_image(rendered_features[0,...,None].mean(0))
-                        metrics['train_aligned/rendered_features0'] = make_wandb_image(rendered_features[1,...,None].mean(0))
-                        metrics['train_aligned/acc_map'] = make_wandb_image(rendered_acc_map.unsqueeze(-1))
-                        metrics['train_aligned/acc0'] = make_wandb_image(rendered_acc0.unsqueeze(-1))
+                    metrics['train_aligned/target_feature'] = make_wandb_image(targets_features_resize_full[i_train_map[align_target_i]][...,None].mean(0))
+                    metrics['train_aligned/target_feature_samples'] = make_wandb_image(target_feature_samples[0,...,None].mean(0))
+                    metrics['train_aligned/rendered_features'] = make_wandb_image(rendered_features[0,...,None].mean(0))
+                    metrics['train_aligned/rendered_features0'] = make_wandb_image(rendered_features[1,...,None].mean(0))
+                    metrics['train_aligned/acc_map'] = make_wandb_image(rendered_acc_map.unsqueeze(-1))
+                    metrics['train_aligned/acc0'] = make_wandb_image(rendered_acc0.unsqueeze(-1))
 
         #####  Core optimization loop  #####
 
@@ -1238,43 +1267,39 @@ def train():
             assert rendered_embedding.ndim == 2  # [L,D]
             assert target_embeddings.ndim == 3  # [N,L,D]
 
-            # NOTE: Randomly sampling a target (run 031) is worse than sampling the same target as MSE (run 032)
-            target_i = i_train_map[img_i]
-            target_emb = target_embeddings[target_i, 0]
-            rendered_emb = rendered_embedding[0]
-            rendered_emb0 = rendered_embedding0[0]
+            # Randomly sample a target
+            assert len(args.consistency_loss_comparison) == 1 and args.consistency_loss_comparison[0] == 'cosine_sim', 'deprecated'
+            if args.consistency_model_type == 'clip_vit':
+                # Modified CLIP ViT to return sequence features. Extract the [CLS] token features
+                rendered_emb = rendered_embedding[0]
+                rendered_emb0 = rendered_embedding[0]
+                target_emb = target_embeddings[:, 0]
+            else:
+                rendered_emb, rendered_emb0, target_emb = rendered_embedding, rendered_embedding0, target_embeddings
 
-            consistency_loss, consistency_loss0 = [], []
-            if 'cosine_sim' in args.consistency_loss_comparison:
-                consistency_loss.append(-torch.cosine_similarity(target_emb, rendered_emb, dim=-1))
-                consistency_loss0.append(-torch.cosine_similarity(target_emb, rendered_emb0, dim=-1))
+            if args.consistency_loss_sampling == 'single_random':
+                target_i = np.random.randint(target_emb.shape[0])
+                target_emb = target_emb[target_i]
+                consistency_loss = -torch.cosine_similarity(target_emb, rendered_emb, dim=-1)
+                consistency_loss0 = -torch.cosine_similarity(target_emb, rendered_emb0, dim=-1)
+            elif args.consistency_loss_sampling == 'distance_weighted':
+                with torch.no_grad():
+                    target_xyz_origin = poses[i_train][:, :3, -1]  # [N, 3]
+                    rendered_xyz_origin = pose[:3, -1].unsqueeze(0)  # [1, 3]
+                    diffs = target_xyz_origin - rendered_xyz_origin
+                    target_distances = torch.sqrt((diffs ** 2).sum(dim=-1))  # [N]
+                    target_weights = F.softmax(-target_distances / args.consistency_loss_sampling_temp)  # [N]
 
-            if 'mse' in args.consistency_loss_comparison:
-                consistency_loss.append(F.mse_loss(rendered_emb, target_emb))
-                consistency_loss0.append(F.mse_loss(rendered_emb0, target_emb))
+                    metrics['train_ctr/target_distances'] = make_wandb_histogram(target_distances)
+                    metrics['train_ctr/target_weights'] = make_wandb_histogram(target_weights)
 
-            if 'max_patch_match_alltargets' in args.consistency_loss_comparison:
-                patch_sim = get_patch_similarity_matrix(rendered_embedding[1:], target_embeddings[:, 1:])  # [L-1,num_targ*(L-1)]
-                max_patch_sim, _ = torch.max(patch_sim, dim=1)  # max across target patches
-                consistency_loss.append(-torch.mean(max_patch_sim))  # mean across rendered patches
+                consistency_loss = -torch.cosine_similarity(target_emb, rendered_emb.unsqueeze(0), dim=-1)  # [N]
+                metrics['train_ctr/consistency_loss_alltargets'] = make_wandb_histogram(consistency_loss)
+                consistency_loss = torch.sum(target_weights * consistency_loss)
 
-                patch_sim0 = get_patch_similarity_matrix(rendered_embedding0[1:], target_embeddings[:, 1:])
-                max_patch_sim0, _ = torch.max(patch_sim0, dim=1)
-                consistency_loss0.append(-torch.mean(max_patch_sim0))
-
-            if 'max_patch_match_sametarget' in args.consistency_loss_comparison:
-                patch_sim = get_patch_similarity_matrix(
-                    rendered_embedding[1:], target_embeddings[target_i, 1:].unsqueeze(0))  # [L-1,L-1]
-                max_patch_sim, _ = torch.max(patch_sim, dim=1)  # max across target patches
-                consistency_loss.append(-torch.mean(max_patch_sim))  # mean across rendered patches
-
-                patch_sim0 = get_patch_similarity_matrix(
-                    rendered_embedding0[1:], target_embeddings[target_i, 1:].unsqueeze(0))  # [L-1,L-1]
-                max_patch_sim0, _ = torch.max(patch_sim0, dim=1)
-                consistency_loss0.append(-torch.mean(max_patch_sim0))
-
-            consistency_loss = torch.mean(torch.stack(consistency_loss))
-            consistency_loss0 = torch.mean(torch.stack(consistency_loss0))
+                consistency_loss0 = -torch.cosine_similarity(target_emb, rendered_emb0.unsqueeze(0), dim=-1)
+                metrics['train_ctr/consistency_loss0_alltargets'] = make_wandb_histogram(consistency_loss0)
+                consistency_loss0 = torch.sum(target_weights * consistency_loss0)
 
             loss = (loss + consistency_loss * args.consistency_loss_lam +
                     consistency_loss0 * args.consistency_loss_lam0)

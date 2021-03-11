@@ -127,6 +127,7 @@ class NeRF(nn.Module):
         
         if use_viewdirs:
             self.feature_linear = DenseLayer(W, W, activation="linear")
+            # TODO: use a softplus activation
             self.alpha_linear = DenseLayer(W, 1, activation="linear")
             self.rgb_linear = DenseLayer(W//2, 3, activation="linear")
         else:
