@@ -61,6 +61,51 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     return outputs
 
 
+''' # This implementation chunks xyz and viewdir embedding as well as fn
+    # evaluation. However, it is more CPU intensive.
+def batchify(fn, chunk):
+    """Constructs a version of 'fn' that applies to smaller batches.
+    """
+    if chunk is None:
+        return fn
+    def ret(inputs, dirs=None):
+        if dirs is not None:
+            assert inputs.shape[0] == dirs.shape[0]
+        chunks = []
+        for i in range(0, inputs.shape[0], chunk):
+            input_chunk = inputs[i:i+chunk]
+            if dirs is not None:
+                dirs_chunk = dirs[i:i+chunk]
+            chunks.append(fn(input_chunk, dirs_chunk))
+        return torch.cat(chunks, 0)
+    return ret
+
+
+def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
+    """Prepares inputs and applies network 'fn'.
+    """
+    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
+
+    if viewdirs is not None:
+        input_dirs = viewdirs.cpu()[:,None].expand(inputs.shape)
+        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
+
+    def embed_and_eval_chunk(inputs, dirs=None):
+        embedded = embed_fn(inputs.to(device))
+        assert 'cuda' in str(embedded.device)
+        if dirs is not None:
+            embedded_dirs = embeddirs_fn(dirs.to(device))
+            assert 'cuda' in str(embedded_dirs.device)
+            embedded = torch.cat([embedded, embedded_dirs], -1)
+        return fn(embedded)
+
+    outputs_flat = batchify(embed_and_eval_chunk, netchunk)(inputs_flat, input_dirs_flat)
+    assert 'cuda' in str(outputs_flat.device)
+    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
+    return outputs
+'''
+
+
 def batchify_rays(rays_flat, chunk=1024*32, keep_keys=None, **kwargs):
     """Render rays in smaller minibatches to avoid OOM.
     """
@@ -490,6 +535,11 @@ def get_embed_fn(model_type, num_layers=-1, spatial=False, checkpoint=False):
             else:
                 embed = lambda ims: clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims), num_layers=num_layers)  # [N,L=50,D]
             assert not clip_utils.clip_model_vit.training
+        elif model_type == 'clip_rn50x4':
+            assert not spatial
+            clip_utils.load_rn(name='RN50x4', jit=False)
+            assert not clip_utils.clip_model_rn.training
+            embed = lambda ims: clip_utils.clip_model_rn(images_or_text=clip_utils.CLIP_NORMALIZE(ims), featurize=False)
     elif model_type.startswith('timm_'):
         assert num_layers == -1
         assert not spatial
@@ -1065,8 +1115,8 @@ def train():
         # i_batch = 0
 
     # Move training data to GPU
-    images = torch.Tensor(images)
-    poses = torch.Tensor(poses)
+    images = torch.Tensor(images).to(device)
+    poses = torch.Tensor(poses).to(device)
     # if use_batching:
     #     rays_rgb = torch.Tensor(rays_rgb).to(device)
 
@@ -1082,7 +1132,7 @@ def train():
     if any_rendered_loss:
         with torch.no_grad():
             targets = images[i_train].permute(0, 3, 1, 2).to(device)
-        render_loss_interval = args.render_loss_interval
+    render_loss_interval = args.render_loss_interval
 
     # Embed training images for consistency loss
     if calc_ctr_loss:
@@ -1172,9 +1222,9 @@ def train():
             target_s = target_s.to(device)
 
         # Representational consistency loss with rendered image
+        render_loss_iter = i % render_loss_interval == 0
         if any_rendered_loss:
             metrics['train_ctr/render_loss_interval'] = render_loss_interval
-            render_loss_iter = i % render_loss_interval == 0
             if args.render_increase_interval_every > 0 and i%args.render_increase_interval_every == 0:
                 # Reduce frequency of rendering losses
                 render_loss_interval += args.render_increase_interval_delta
@@ -1251,18 +1301,18 @@ def train():
                 rendered_acc_map = extras['acc_map']
                 rendered_acc0 = extras['acc0']
 
-                # Log rendered images
-                metrics['train_ctr/rgb'] = make_wandb_image(extras['rgb_map'], 'clip')
-                metrics['train_ctr/rgb0'] = make_wandb_image(extras['rgb0'], 'clip')
+            # Log rendered images
+            metrics['train_ctr/rgb'] = make_wandb_image(extras['rgb_map'], 'clip')
+            metrics['train_ctr/rgb0'] = make_wandb_image(extras['rgb0'], 'clip')
 
-                # Log rendered features and warped target features
-                if args.aligned_loss:
-                    metrics['train_aligned/target_feature'] = make_wandb_image(targets_features_resize_full[i_train_map[align_target_i]][...,None].mean(0))
-                    metrics['train_aligned/target_feature_samples'] = make_wandb_image(target_feature_samples[0,...,None].mean(0))
-                    metrics['train_aligned/rendered_features'] = make_wandb_image(rendered_features[0,...,None].mean(0))
-                    metrics['train_aligned/rendered_features0'] = make_wandb_image(rendered_features[1,...,None].mean(0))
-                    metrics['train_aligned/acc_map'] = make_wandb_image(rendered_acc_map.unsqueeze(-1))
-                    metrics['train_aligned/acc0'] = make_wandb_image(rendered_acc0.unsqueeze(-1))
+            # Log rendered features and warped target features
+            if args.aligned_loss:
+                metrics['train_aligned/target_feature'] = make_wandb_image(targets_features_resize_full[i_train_map[align_target_i]][...,None].mean(0))
+                metrics['train_aligned/target_feature_samples'] = make_wandb_image(target_feature_samples[0,...,None].mean(0))
+                metrics['train_aligned/rendered_features'] = make_wandb_image(rendered_features[0,...,None].mean(0))
+                metrics['train_aligned/rendered_features0'] = make_wandb_image(rendered_features[1,...,None].mean(0))
+                metrics['train_aligned/acc_map'] = make_wandb_image(rendered_acc_map.unsqueeze(-1))
+                metrics['train_aligned/acc0'] = make_wandb_image(rendered_acc0.unsqueeze(-1))
 
         #####  Core optimization loop  #####
 
@@ -1275,17 +1325,19 @@ def train():
             # Resize and embed rendered images
             rgbs_resize_c = F.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
             rendered_embedding, rendered_embedding0 = embed(rgbs_resize_c)
-            assert rendered_embedding.ndim == 2  # [L,D]
-            assert target_embeddings.ndim == 3  # [N,L,D]
 
             # Randomly sample a target
             assert len(args.consistency_loss_comparison) == 1 and args.consistency_loss_comparison[0] == 'cosine_sim', 'deprecated'
             if args.consistency_model_type == 'clip_vit':
                 # Modified CLIP ViT to return sequence features. Extract the [CLS] token features
+                assert rendered_embedding.ndim == 2  # [L,D]
+                assert target_embeddings.ndim == 3  # [N,L,D]
                 rendered_emb = rendered_embedding[0]
                 rendered_emb0 = rendered_embedding[0]
                 target_emb = target_embeddings[:, 0]
             else:
+                assert rendered_embedding.ndim == 1  # [D]
+                assert target_embeddings.ndim == 2  # [N,D]
                 rendered_emb, rendered_emb0, target_emb = rendered_embedding, rendered_embedding0, target_embeddings
 
             if args.consistency_loss_sampling == 'single_random':
@@ -1301,6 +1353,8 @@ def train():
                     target_distances = torch.sqrt((diffs ** 2).sum(dim=-1))  # [N]
                     target_weights = F.softmax(-target_distances / args.consistency_loss_sampling_temp)  # [N]
 
+                    metrics['train_ctr/target_weighted_distance'] = torch.sum(target_weights * target_distances).item()
+                    metrics['train_ctr/target_mean_distance'] = torch.mean(target_distances).item()
                     metrics['train_ctr/target_distances'] = make_wandb_histogram(target_distances)
                     metrics['train_ctr/target_weights'] = make_wandb_histogram(target_weights)
 
@@ -1499,7 +1553,7 @@ def train():
             # Log a rendered validation view to Tensorboard
             img_i=np.random.choice(i_val)
             target = images[img_i]
-            pose = poses[img_i, :3,:4]
+            pose = poses[img_i, :3,:4].to(device)
             with torch.no_grad():
                 rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
                                                     **render_kwargs_test)
