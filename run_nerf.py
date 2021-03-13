@@ -279,7 +279,7 @@ def create_nerf(args):
     ##########################
 
     # Load checkpoints
-    if args.ft_path is not None and args.ft_path!='None':
+    if args.ft_path is not None and args.ft_path!='None' and not args.render_only:
         ckpts = [args.ft_path]
     else:
         ckpts = [os.path.join(basedir, expname, f) for f in sorted(os.listdir(os.path.join(basedir, expname))) if 'tar' in f]
@@ -801,6 +801,8 @@ def config_parser():
                         help='frequency of render_poses video saving')
     parser.add_argument("--save_splits", action="store_true",
                         help='save ground truth images and poses in each split')
+    parser.add_argument("--i_log_ctr_img", type=int, default=1,
+                        help='DEPRECATED. Unused argument.')
 
     ### options for learning with few views
     parser.add_argument("--max_train_views", type=int, default=-1,
