@@ -45,7 +45,7 @@ def probe(
             assert not clip_utils.clip_model_rn.training
         elif model_type == 'clip_vit':
             clip_utils.load_vit()
-            embed = lambda ims: clip_utils.clip_model_vit(images_or_text=ims)
+            embed = lambda ims: clip_utils.clip_model_vit(images_or_text=ims)[:, 0]  # select CLS token embedding, [N, D]
             assert not clip_utils.clip_model_vit.training
     elif model_type == 'crw_rn18':
         import crw_utils

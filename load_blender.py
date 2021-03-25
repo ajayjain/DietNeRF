@@ -42,7 +42,7 @@ def pose_spherical_uniform(theta_range, phi_range, radius_range):
     return pose
 
 
-def load_blender_data(basedir, half_res=False, testskip=1):
+def load_blender_data(basedir, half_res=False, testskip=1, num_render_poses=40):
     splits = ['train', 'val', 'test']
     metas = {}
     for s in splits:
@@ -80,7 +80,7 @@ def load_blender_data(basedir, half_res=False, testskip=1):
     camera_angle_x = float(meta['camera_angle_x'])
     focal = .5 * W / np.tan(.5 * camera_angle_x)
     
-    render_poses = torch.stack([pose_spherical(angle, -30.0, 4.0) for angle in np.linspace(-180,180,40+1)[:-1]], 0)
+    render_poses = torch.stack([pose_spherical(angle, -30.0, 4.0) for angle in np.linspace(-180,180,num_render_poses+1)[:-1]], 0)
     
     if half_res:
         H = H//2

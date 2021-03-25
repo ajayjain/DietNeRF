@@ -30,9 +30,10 @@ consistency_nW = 168
 consistency_jitter_rays = True
 consistency_model_type = timm_vit_base_patch32_384
 consistency_size = 384
-consistency_interp_mode = bicubic
+# consistency_interp_mode = bicubic  # deprecated argument
+pixel_interp_mode = bicubic
 
-consistency_reembed_target = False
+# consistency_reembed_target = False  # deprecated argument
 consistency_poses = uniform
 consistency_theta_range = [-180, 180]
 consistency_phi_range = [-90, 0]

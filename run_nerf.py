@@ -286,6 +286,9 @@ def create_nerf(args):
 
     print('Found ckpts', ckpts)
     if len(ckpts) > 0 and not args.no_reload:
+        if args.reload_iter:
+            print('Trying to reload a specific iteration:', args.reload_iter)
+            ckpts = list(filter(lambda ckpt: ckpt.endswith(f'/{args.reload_iter}.tar'), ckpts))
         ckpt_path = ckpts[-1]
         print('Reloading from', ckpt_path)
         ckpt = torch.load(ckpt_path)
@@ -474,8 +477,8 @@ def render_rays(ray_batch,
     ret['pts'] = pts
     if retraw:
         ret['raw'] = raw
-        ret['raw0'] = raw0
     if N_importance > 0:
+        ret['raw0'] = raw0
         ret['rgb0'] = rgb_map_0
         ret['disp0'] = disp_map_0
         ret['acc0'] = acc_map_0
@@ -719,6 +722,8 @@ def config_parser():
                         help='do not reload weights from saved ckpt')
     parser.add_argument("--ft_path", type=str, default=None, 
                         help='specific weights npy file to reload for coarse network')
+    parser.add_argument("--reload_iter", type=str, default=None, 
+                        help='load a specific iteration rather than the latest. will load expdir/<reload_iter>.tar')
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--use_softplus_alpha", action='store_true',
                         help='use a softplus activation on predicted alphas rather than relu')
@@ -770,6 +775,9 @@ def config_parser():
                         help='set to render synthetic data on a white bkgd (always use for dvoxels)')
     parser.add_argument("--half_res", action='store_true', 
                         help='load blender synthetic data at 400x400 instead of 800x800')
+    parser.add_argument("--full_res", action='store_false', dest='half_res',
+                        help='load blender synthetic data at 800x800')
+    parser.add_argument("--num_render_poses", type=int, default=40)
 
     ## llff flags
     parser.add_argument("--factor", type=int, default=8, 
@@ -807,6 +815,7 @@ def config_parser():
     ### options for learning with few views
     parser.add_argument("--max_train_views", type=int, default=-1,
                         help='limit number of training views for the mse loss')
+    parser.add_argument("--hardcode_train_views", type=int, nargs="+", default=[])
     # Options for rendering shared between different losses
     parser.add_argument("--render_loss_interval", "--consistency_loss_interval",
         type=float, default=1)
@@ -935,7 +944,7 @@ def train():
         print('NEAR FAR', near, far)
 
     elif args.dataset_type == 'blender':
-        images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
+        images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip, num_render_poses=args.num_render_poses)
         print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_val, i_test = i_split
 
@@ -968,7 +977,11 @@ def train():
     i_train_poses = i_train  # Use all training poses for auxiliary representation consistency loss.
                              # TODO: Could also use any continuous set of poses including the
                              # val and test poses, since we don't use the images for aux loss.
-    if args.max_train_views > 0:
+    if len(args.hardcode_train_views):
+        print('Original training views:', i_train)
+        i_train = np.array(args.hardcode_train_views)
+        print('Hardcoded train views:', i_train)
+    elif args.max_train_views > 0:
         print('Original training views:', i_train)
         i_train = np.random.choice(i_train, size=args.max_train_views, replace=False)
         print('Subsampled train views:', i_train)
@@ -1263,7 +1276,10 @@ def train():
                                 keep_keys=consistency_keep_keys,
                                 **render_kwargs_train)[-1]
                 # rgb0 is the rendering from the coarse network, while rgb_map uses the fine network
-                rgbs = torch.stack([extras['rgb_map'], extras['rgb0']], dim=0)
+                if args.N_importance > 0:
+                    rgbs = torch.stack([extras['rgb_map'], extras['rgb0']], dim=0)
+                else:
+                    rgbs = extras['rgb_map'].unsqueeze(0)
                 rgbs = rgbs.permute(0, 3, 1, 2).clamp(0, 1)
 
             if i == 0:
@@ -1305,7 +1321,8 @@ def train():
 
             # Log rendered images
             metrics['train_ctr/rgb'] = make_wandb_image(extras['rgb_map'], 'clip')
-            metrics['train_ctr/rgb0'] = make_wandb_image(extras['rgb0'], 'clip')
+            if args.N_importance > 0:
+                metrics['train_ctr/rgb0'] = make_wandb_image(extras['rgb0'], 'clip')
 
             # Log rendered features and warped target features
             if args.aligned_loss:
@@ -1326,7 +1343,11 @@ def train():
 
             # Resize and embed rendered images
             rgbs_resize_c = F.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
-            rendered_embedding, rendered_embedding0 = embed(rgbs_resize_c)
+            rendered_embeddings = embed(rgbs_resize_c)
+            rendered_embedding = rendered_embeddings[0]
+            if args.N_importance > 0:
+                # NOTE(3/14/21): Fixed a bug that wasn't updating the coarse network with the consistency loss
+                rendered_embedding0 = rendered_embeddings[1]  # for coarse net
 
             # Randomly sample a target
             assert len(args.consistency_loss_comparison) == 1 and args.consistency_loss_comparison[0] == 'cosine_sim', 'deprecated'
@@ -1335,18 +1356,22 @@ def train():
                 assert rendered_embedding.ndim == 2  # [L,D]
                 assert target_embeddings.ndim == 3  # [N,L,D]
                 rendered_emb = rendered_embedding[0]
-                rendered_emb0 = rendered_embedding[0]
+                if args.N_importance > 0:
+                    rendered_emb0 = rendered_embedding0[0]
                 target_emb = target_embeddings[:, 0]
             else:
                 assert rendered_embedding.ndim == 1  # [D]
                 assert target_embeddings.ndim == 2  # [N,D]
-                rendered_emb, rendered_emb0, target_emb = rendered_embedding, rendered_embedding0, target_embeddings
+                rendered_emb, target_emb = rendered_embedding, target_embeddings
+                if args.N_importance > 0:
+                    rendered_emb0 = rendered_embedding0
 
             if args.consistency_loss_sampling == 'single_random':
                 target_i = np.random.randint(target_emb.shape[0])
                 target_emb = target_emb[target_i]
                 consistency_loss = -torch.cosine_similarity(target_emb, rendered_emb, dim=-1)
-                consistency_loss0 = -torch.cosine_similarity(target_emb, rendered_emb0, dim=-1)
+                if args.N_importance > 0:
+                    consistency_loss0 = -torch.cosine_similarity(target_emb, rendered_emb0, dim=-1)
             elif args.consistency_loss_sampling == 'distance_weighted':
                 with torch.no_grad():
                     target_xyz_origin = poses[i_train][:, :3, -1]  # [N, 3]
@@ -1364,12 +1389,14 @@ def train():
                 metrics['train_ctr/consistency_loss_alltargets'] = make_wandb_histogram(consistency_loss)
                 consistency_loss = torch.sum(target_weights * consistency_loss)
 
-                consistency_loss0 = -torch.cosine_similarity(target_emb, rendered_emb0.unsqueeze(0), dim=-1)
-                metrics['train_ctr/consistency_loss0_alltargets'] = make_wandb_histogram(consistency_loss0)
-                consistency_loss0 = torch.sum(target_weights * consistency_loss0)
+                if args.N_importance > 0:
+                    consistency_loss0 = -torch.cosine_similarity(target_emb, rendered_emb0.unsqueeze(0), dim=-1)
+                    metrics['train_ctr/consistency_loss0_alltargets'] = make_wandb_histogram(consistency_loss0)
+                    consistency_loss0 = torch.sum(target_weights * consistency_loss0)
 
-            loss = (loss + consistency_loss * args.consistency_loss_lam +
-                    consistency_loss0 * args.consistency_loss_lam0)
+            loss = loss + consistency_loss * args.consistency_loss_lam
+            if args.N_importance > 0:
+                loss = loss + consistency_loss0 * args.consistency_loss_lam0
 
         if args.aligned_loss and render_loss_iter:
             rendered_features_resize_c = F.interpolate(rendered_features, (args.render_nH, args.render_nW), mode=args.feature_interp_mode)
@@ -1496,7 +1523,7 @@ def train():
             torch.save({
                 'global_step': global_step,
                 'network_fn_state_dict': network_fn.state_dict(),
-                'network_fine_state_dict': network_fine.state_dict(),
+                'network_fine_state_dict': network_fine.state_dict() if network_fine is not None else None,
                 'optimizer_state_dict': optimizer.state_dict(),
             }, path)
             print('Saved checkpoints at', path)
@@ -1531,20 +1558,22 @@ def train():
                 "train/loss": loss.item(),
                 "train/psnr": psnr.item(),
                 "train/mse": img_loss.item(),
-                "train/mse0": img_loss0.item(),
-                "gradients/norm": gradient_norm(network_fine.parameters()),
-                "gradients/norm0": gradient_norm(network_fn.parameters()),
                 "train/lrate": new_lrate,
             })
+            metrics["gradients/norm_coarse"] = gradient_norm(network_fn.parameters())
             if args.N_importance > 0:
+                metrics["gradients/norm_fine"] = gradient_norm(network_fine.parameters())
                 metrics["train/psnr0"] = psnr0.item()
+                metrics["train/mse0"] = img_loss0.item()
             if render_loss_iter:
                 if calc_ctr_loss:
                     metrics["train_ctr/consistency_loss"] = consistency_loss.item()
-                    metrics["train_ctr/consistency_loss0"] = consistency_loss0.item()
+                    if args.N_importance > 0:
+                        metrics["train_ctr/consistency_loss0"] = consistency_loss0.item()
                 if args.aligned_loss:
                     metrics["train_aligned/aligned_loss"] = aligned_loss.item()
-                    metrics["train_aligned/aligned_loss0"] = aligned_loss0.item()
+                    if args.N_importance > 0:
+                        metrics["train_aligned/aligned_loss0"] = aligned_loss0.item()
                 if args.patch_gan_loss:
                     metrics["gradients/normD"] = gradient_norm(netD.parameters())
 
