@@ -516,10 +516,11 @@ def sample_rays(H, W, rays_o, rays_d, N_rand, i, start, precrop_iters, precrop_f
     return batch_rays, select_coords
 
 
-def get_embed_fn(model_type, num_layers=-1, spatial=False, checkpoint=False):
+def get_embed_fn(model_type, num_layers=-1, spatial=False, checkpoint=False, clip_cache_root=None):
     if model_type.startswith('clip_'):
         if model_type == 'clip_rn50':
-            clip_utils.load_rn(jit=False)
+            assert clip_cache_root
+            clip_utils.load_rn(jit=False, root=clip_cache_root)
             if spatial:
                 _clip_dtype = clip_utils.clip_model_rn.clip_model.dtype
                 assert num_layers == -1
@@ -529,8 +530,12 @@ def get_embed_fn(model_type, num_layers=-1, spatial=False, checkpoint=False):
             else:
                 embed = lambda ims: clip_utils.clip_model_rn(images_or_text=clip_utils.CLIP_NORMALIZE(ims), num_layers=num_layers).unsqueeze(1)
             assert not clip_utils.clip_model_rn.training
-        elif model_type == 'clip_vit':
-            clip_utils.load_vit()
+        elif model_type.startswith('clip_vit'):
+            assert clip_cache_root
+            if model_type == 'clip_vit':
+                clip_utils.load_vit(root=clip_cache_root)
+            elif model_type == 'clip_vit_b16':
+                clip_utils.load_vit('ViT-B/16', root=clip_cache_root)
             if spatial:
                 def embed(ims):
                     emb = clip_utils.clip_model_vit(images_or_text=clip_utils.CLIP_NORMALIZE(ims), num_layers=num_layers)  # [N,L=50,D]
@@ -792,7 +797,8 @@ def config_parser():
                         help='will take every 1/N images as LLFF test set, paper uses 8')
 
     # logging/saving options
-    parser.add_argument("--wandb_entity",   type=str, default='ajayj')
+    parser.add_argument("--wandb_entity",   type=str, default=None)
+    parser.add_argument("--wandb_project",   type=str, default='dietnerf')
     parser.add_argument("--i_log",   type=int, default=1, 
                         help='frequency of metric logging')
     parser.add_argument("--i_log_raw_hist",   type=int, default=2, 
@@ -861,6 +867,7 @@ def config_parser():
     # Consistency model arguments
     parser.add_argument("--consistency_model_type", type=str, default='clip_vit') # choices=['clip_vit', 'clip_rn50']
     parser.add_argument("--consistency_model_num_layers", type=int, default=-1)
+    parser.add_argument("--clip_cache_root", type=str, default=os.path.expanduser("~/.cache/clip"))
 
     # Aligned feature consistency arguments
     parser.add_argument("--aligned_loss", action='store_true')
@@ -904,7 +911,7 @@ def train():
     parser = config_parser()
     args = parser.parse_args()
 
-    wandb.init(project="nerf-nl", entity=args.wandb_entity)
+    wandb.init(project=args.wandb_project, entity=args.wandb_entity)
     wandb.run.name = args.expname
     wandb.run.save()
     wandb.config.update(args)
@@ -989,9 +996,12 @@ def train():
     # Load embedding network for rendering losses
     if args.consistency_loss != 'none':
         print(f'Using auxilliary consistency loss [{args.consistency_loss}], fine weight [{args.consistency_loss_lam}], coarse weight [{args.consistency_loss_lam0}]')
-        embed = get_embed_fn(args.consistency_model_type, args.consistency_model_num_layers, checkpoint=args.checkpoint_embedding)
+        embed = get_embed_fn(args.consistency_model_type, args.consistency_model_num_layers, checkpoint=args.checkpoint_embedding, clip_cache_root=args.clip_cache_root)
     if args.aligned_loss:
-        embed_spatial = get_embed_fn(args.spatial_model_type, args.spatial_model_num_layers, spatial=True, checkpoint=args.checkpoint_embedding)
+        embed_spatial = get_embed_fn(
+            args.spatial_model_type, args.spatial_model_num_layers, spatial=True,
+            checkpoint=args.checkpoint_embedding,
+            clip_cache_root=args.clip_cache_root)
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -1351,7 +1361,7 @@ def train():
 
             # Randomly sample a target
             assert len(args.consistency_loss_comparison) == 1 and args.consistency_loss_comparison[0] == 'cosine_sim', 'deprecated'
-            if args.consistency_model_type == 'clip_vit':
+            if args.consistency_model_type.startswith('clip_vit'):
                 # Modified CLIP ViT to return sequence features. Extract the [CLS] token features
                 assert rendered_embedding.ndim == 2  # [L,D]
                 assert target_embeddings.ndim == 3  # [N,L,D]
@@ -1534,12 +1544,12 @@ def train():
             # Turn on testing mode
             with torch.no_grad():
                 rgbs, disps = render_path(render_poses, hwf, args.chunk, render_kwargs_test)
-            print('Done, saving', rgbs.shape, disps.shape)
-            moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
-            imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
-            imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
-            metrics["render_path/rgb_video"] = wandb.Video(moviebase + 'rgb.mp4')
-            metrics["render_path/disp_video"] = wandb.Video(moviebase + 'disp.mp4')
+                print('Done, saving', rgbs.shape, disps.shape)
+                moviebase = os.path.join(basedir, expname, '{}_spiral_{:06d}_'.format(expname, i))
+                imageio.mimwrite(moviebase + 'rgb.mp4', to8b(rgbs), fps=30, quality=8)
+                imageio.mimwrite(moviebase + 'disp.mp4', to8b(disps / np.max(disps)), fps=30, quality=8)
+                metrics["render_path/rgb_video"] = wandb.Video(moviebase + 'rgb.mp4')
+                metrics["render_path/disp_video"] = wandb.Video(moviebase + 'disp.mp4')
 
         if i%args.i_testset==0 and i > 0:
             testsavedir = os.path.join(basedir, expname, 'testset_{:06d}'.format(i))
@@ -1582,7 +1592,8 @@ def train():
 
         if i%args.i_img==0:
             # Log a rendered validation view to Tensorboard
-            img_i=np.random.choice(i_val)
+            # img_i=np.random.choice(i_val)
+            img_i=i_val[0]
             target = images[img_i]
             pose = poses[img_i, :3,:4].to(device)
             with torch.no_grad():
