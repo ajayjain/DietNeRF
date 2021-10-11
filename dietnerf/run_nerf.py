@@ -25,7 +25,6 @@ from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data, pose_spherical_uniform
 from run_nerf_helpers import *
-import gan_networks
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -880,30 +879,6 @@ def config_parser():
     parser.add_argument("--aligned_loss_lam0", type=float, default=0.1,
                         help="weight for the coarse network's aligned semantic consistency loss")
 
-    # Discriminator losses
-    parser.add_argument("--patch_gan_loss", action='store_true')
-    parser.add_argument("--patch_gan_D_inner_steps", type=int, default=1)
-    parser.add_argument("--patch_gan_D_grad_clip", type=float, default=-1)
-    parser.add_argument("--patch_gan_D_nH", type=int, default=168)
-    parser.add_argument("--patch_gan_D_nW", type=int, default=168)
-    parser.add_argument("--patch_wgan_lambda_gp", type=float, default=0.1)  # SinGAN uses 0.1, but the WGAN-GP paper uses 10
-    parser.add_argument("--patch_gan_D_activation", type=str, default='none', choices=['none', 'sigmoid'])
-    # Train options from BiCycleGAN
-    parser.add_argument('--patch_gan_mode', type=str, default='lsgan', help='the type of GAN objective. [vanilla | lsgan ｜ wgangp]. vanilla GAN loss is the cross-entropy objective used in the original GAN paper.')
-    parser.add_argument('--patch_gan_G_lam', type=float, default=1.0, help='weight on D loss backpropped to NeRF. D(G(random_pose))')
-    parser.add_argument('--patch_gan_lr', type=float, default=0.0002, help='initial learning rate for adam')
-    parser.add_argument('--patch_gan_beta1', type=float, default=0.5, help='momentum term of adam')
-    # parser.add_argument('--patch_gan_lr_policy', type=str, default='linear', help='learning rate policy: linear | step | plateau | cosine')
-    # parser.add_argument('--patch_gan_lr_decay_iters', type=int, default=100, help='multiply by a gamma every lr_decay_iters iterations')
-    # Base options from BiCycleGAN
-    parser.add_argument('--patch_gan_num_Ds', type=int, default=1, help='number of Discrminators')
-    parser.add_argument('--patch_gan_netD', type=str, default='basic_256_multi', help='selects model to use for netD')
-    parser.add_argument('--patch_gan_ndf', type=int, default=64, help='# of discrim filters in the first conv layer')
-    parser.add_argument('--patch_gan_norm', type=str, default='instance', help='instance normalization or batch normalization')
-    parser.add_argument('--patch_gan_init_type', type=str, default='xavier', help='network initialization [normal | xavier | kaiming | orthogonal]')
-    parser.add_argument('--patch_gan_init_gain', type=float, default=0.02, help='scaling factor for normal, xavier and orthogonal.')
-    parser.add_argument('--patch_gan_nl', type=str, default='relu', help='non-linearity activation: relu | lrelu | elu')
-
     return parser
 
 
@@ -1153,7 +1128,7 @@ def train():
     print('VAL views are', i_val)
 
     calc_ctr_loss = args.consistency_loss.startswith('consistent_with_target_rep')
-    any_rendered_loss = (calc_ctr_loss or args.aligned_loss or args.patch_gan_loss)
+    any_rendered_loss = (calc_ctr_loss or args.aligned_loss)
     if any_rendered_loss:
         with torch.no_grad():
             targets = images[i_train].permute(0, 3, 1, 2).to(device)
@@ -1186,20 +1161,6 @@ def train():
 
         consistency_keep_keys = ['rgb_map', 'rgb0', 'pts', 'pts0', 'weights', 'weights0', 'acc_map', 'acc0']
  
-    if args.patch_gan_loss:
-        netD = gan_networks.define_D(3,
-            args.patch_gan_ndf,
-            netD=args.patch_gan_netD,
-            norm=args.patch_gan_norm,
-            nl=args.patch_gan_nl,
-            init_type=args.patch_gan_init_type,
-            init_gain=args.patch_gan_init_gain,
-            num_Ds=args.patch_gan_num_Ds,
-            activation=args.patch_gan_D_activation).to(device)
-        print('Discriminator:', netD)
-        criterionGAN = gan_networks.GANLoss(gan_mode=args.patch_gan_mode).to(device)
-        optimizer_D = torch.optim.Adam(netD.parameters(), lr=args.patch_gan_lr, betas=(args.patch_gan_beta1, 0.999))
-
     start = start + 1
     for i in trange(start, N_iters):
         metrics = {}
@@ -1425,25 +1386,6 @@ def train():
             loss = (loss + aligned_loss * args.aligned_loss_lam +
                     aligned_loss0 * args.aligned_loss_lam0)
 
-        if args.patch_gan_loss and render_loss_iter:
-            # Compute realism loss for NeRF training
-            gan_networks.set_requires_grad([netD], False)
-
-            # Flip fine network's rendering
-            rgbs_G = torch.cat([rgbs[:1], rgbs[:1].flip(3)], dim=0)
-            if rgbs_G.shape[2:] != (args.patch_gan_D_nH, args.patch_gan_D_nW):
-                rgbs_G = F.interpolate(rgbs_G, (args.patch_gan_D_nH, args.patch_gan_D_nW), mode=args.pixel_interp_mode)
-            pred_fake = netD(rgbs_G * 2 - 1)
-            if args.patch_gan_num_Ds > 1:
-                print('patch gan gen loss pred shapes', 'rgbs_G', rgbs_G.shape, 'pred_fake', len(pred_fake), list(map(lambda x: x.shape, pred_fake)))
-
-            loss_G, _ = criterionGAN(pred_fake, True)
-            loss = loss + loss_G * args.patch_gan_G_lam
-
-            metrics['train_patch_gan/G/rgbs_G'] = make_wandb_image(rgbs_G[0].permute(1,2,0), 'clip')  # fine network
-            metrics['train_patch_gan/G/loss_G'] = loss_G.item()
-            log_discriminator_histograms(metrics, 'train_patch_gan/G/pred_fake', pred_fake)
-
         if not args.no_mse:
             # Standard NeRF MSE loss with subsampled rays
             rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, rays=batch_rays,
@@ -1465,55 +1407,6 @@ def train():
         scaler.step(optimizer)
         scaler.update()
 
-        if args.patch_gan_loss and render_loss_iter:
-            # Compute loss for discriminator training
-            gan_networks.set_requires_grad([netD], True)
-            for _ in range(args.patch_gan_D_inner_steps):
-                optimizer_D.zero_grad()
-                ## Flip fine net rendering and targets
-                with torch.no_grad():
-                    rgbs_D = rgbs.detach()[:1]
-                    rgbs_D = torch.cat([rgbs_D, rgbs_D.flip(3)], dim=0)
-                    if rgbs_D.shape[2:] != (args.patch_gan_D_nH, args.patch_gan_D_nW):
-                        rgbs_D = F.interpolate(rgbs_D, (args.patch_gan_D_nH, args.patch_gan_D_nW), mode=args.pixel_interp_mode)
-
-                    targets_D = targets[np.random.randint(len(targets))].unsqueeze(0)
-                    targets_D = torch.cat([targets_D, targets_D.flip(3)], dim=0)
-                    if targets_D.shape[2:] != (args.patch_gan_D_nH, args.patch_gan_D_nW):
-                        targets_D = F.interpolate(targets.detach(), (args.patch_gan_D_nH, args.patch_gan_D_nW), mode=args.pixel_interp_mode)
-
-                pred_fake = netD(rgbs_D.detach())
-                pred_real = netD(targets_D.detach())
-
-                loss_D_fake, _ = criterionGAN(pred_fake, False)
-                loss_D_real, _ = criterionGAN(pred_real, True)
-                loss_D = loss_D_fake + loss_D_real
-
-                if args.patch_gan_mode == 'wgangp':
-                    penalty_target_idx = np.random.choice(targets_D.shape[0], size=rgbs_D.shape[0], replace=False)
-                    gradient_penalty = gan_networks.cal_gradient_penalty(netD,
-                        fake_data=rgbs_D.detach(), real_data=targets_D[penalty_target_idx].detach(),
-                        lambda_gp=args.patch_wgan_lambda_gp, device=device)
-                    loss_D = loss_D + gradient_penalty
-                    metrics['train_patch_gan/D/gradient_penality'] = gradient_penalty.item()
-
-                scaler.scale(loss_D).backward()
-                scaler.step(optimizer_D)
-
-                if args.patch_gan_D_grad_clip > 0:
-                    scaler.unscale_(optimizer_D)
-                    nn.utils.clip_grad.clip_grad_norm_(netD.parameters(), max_norm=args.patch_gan_D_grad_clip)
-
-                scaler.update()
-
-            metrics['train_patch_gan/D/rgbs_D'] = make_wandb_image(rgbs_D[0].permute(1,2,0), 'clip')  # fine network
-            metrics['train_patch_gan/D/targets_D'] = make_wandb_image(targets_D[np.random.randint(len(targets_D))].permute(1,2,0), 'clip')
-            metrics['train_patch_gan/D/loss_D'] = loss_D
-            metrics['train_patch_gan/D/loss_D_fake'] = loss_D_fake
-            metrics['train_patch_gan/D/loss_D_real'] = loss_D_real
-            log_discriminator_histograms(metrics, 'train_patch_gan/D/pred_fake', pred_fake)
-            log_discriminator_histograms(metrics, 'train_patch_gan/D/pred_real', pred_real)
-
         # # NOTE: IMPORTANT!
         ###   update learning rate   ###
         decay_rate = 0.1
@@ -1521,10 +1414,6 @@ def train():
         new_lrate = args.lrate * (decay_rate ** (global_step / decay_steps))
         for param_group in optimizer.param_groups:
             param_group['lr'] = new_lrate
-        if args.patch_gan_loss:
-            new_lrate_D = args.patch_gan_lr * (decay_rate ** (global_step / decay_steps))
-            for param_group in optimizer_D.param_groups:
-                param_group['lr'] = new_lrate_D
         #####           end            #####
 
         # Rest is logging
@@ -1584,8 +1473,6 @@ def train():
                     metrics["train_aligned/aligned_loss"] = aligned_loss.item()
                     if args.N_importance > 0:
                         metrics["train_aligned/aligned_loss0"] = aligned_loss0.item()
-                if args.patch_gan_loss:
-                    metrics["gradients/normD"] = gradient_norm(netD.parameters())
 
         if i%args.i_log_raw_hist==0:
             metrics["train/tran"] = wandb.Histogram(trans.detach().cpu().numpy())
