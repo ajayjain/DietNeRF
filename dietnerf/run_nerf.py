@@ -1279,39 +1279,38 @@ def train():
                 metrics["gradients/norm_fine"] = gradient_norm(network_fine.parameters())
                 metrics["train/psnr0"] = psnr0.item()
                 metrics["train/mse0"] = img_loss0.item()
-            if render_loss_iter:
-                if calc_ctr_loss:
-                    metrics["train_ctr/consistency_loss"] = consistency_loss.item()
-                    if args.N_importance > 0:
-                        metrics["train_ctr/consistency_loss0"] = consistency_loss0.item()
+            if render_loss_iter and calc_ctr_loss:
+                metrics["train_ctr/consistency_loss"] = consistency_loss.item()
+                if args.N_importance > 0:
+                    metrics["train_ctr/consistency_loss0"] = consistency_loss0.item()
 
         if i%args.i_log_raw_hist==0:
             metrics["train/tran"] = wandb.Histogram(trans.detach().cpu().numpy())
 
         if i%args.i_img==0:
             # Log a rendered validation view to Tensorboard
-            img_i=i_val[0]
-            target = images[img_i]
-            pose = poses[img_i, :3,:4].to(device)
             with torch.no_grad():
+                img_i = i_val[0]
+                target = images[img_i]
+                pose = poses[img_i, :3,:4].to(device)
                 rgb, disp, acc, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
                                                     **render_kwargs_test)
 
-            psnr = mse2psnr(img2mse(rgb, target))
+                psnr = mse2psnr(img2mse(rgb, target))
 
-            metrics = {
-                'val/rgb': wandb.Image(to8b(rgb.cpu().numpy())[np.newaxis]),
-                'val/disp': wandb.Image(disp.cpu().numpy()[np.newaxis,...,np.newaxis]),
-                'val/disp_scaled': make_wandb_image(disp[np.newaxis,...,np.newaxis]),
-                'val/acc': wandb.Image(acc.cpu().numpy()[np.newaxis,...,np.newaxis]),
-                'val/acc_scaled': make_wandb_image(acc[np.newaxis,...,np.newaxis]),
-                'val/psnr_holdout': psnr.item(),
-                'val/rgb_holdout': wandb.Image(target.cpu().numpy()[np.newaxis])
-            }
-            if args.N_importance > 0:
-                metrics['rgb0'] = wandb.Image(to8b(extras['rgb0'].cpu().numpy())[np.newaxis])
-                metrics['disp0'] = wandb.Image(extras['disp0'].cpu().numpy()[np.newaxis,...,np.newaxis])
-                metrics['z_std'] = wandb.Image(extras['z_std'].cpu().numpy()[np.newaxis,...,np.newaxis])
+                metrics = {
+                    'val/rgb': wandb.Image(to8b(rgb.cpu().numpy())[np.newaxis]),
+                    'val/disp': wandb.Image(disp.cpu().numpy()[np.newaxis,...,np.newaxis]),
+                    'val/disp_scaled': make_wandb_image(disp[np.newaxis,...,np.newaxis]),
+                    'val/acc': wandb.Image(acc.cpu().numpy()[np.newaxis,...,np.newaxis]),
+                    'val/acc_scaled': make_wandb_image(acc[np.newaxis,...,np.newaxis]),
+                    'val/psnr_holdout': psnr.item(),
+                    'val/rgb_holdout': wandb.Image(target.cpu().numpy()[np.newaxis])
+                }
+                if args.N_importance > 0:
+                    metrics['rgb0'] = wandb.Image(to8b(extras['rgb0'].cpu().numpy())[np.newaxis])
+                    metrics['disp0'] = wandb.Image(extras['disp0'].cpu().numpy()[np.newaxis,...,np.newaxis])
+                    metrics['z_std'] = wandb.Image(extras['z_std'].cpu().numpy()[np.newaxis,...,np.newaxis])
 
         if metrics:
             wandb.log(metrics, step=i)
