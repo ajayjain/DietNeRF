@@ -830,8 +830,6 @@ def config_parser():
 
     # Global semantic consistency loss
     parser.add_argument("--consistency_loss", type=str, default='none', choices=['none', 'consistent_with_target_rep'])
-    parser.add_argument("--consistency_loss_comparison", type=str, default=['cosine_sim'], nargs='+', choices=[
-        'cosine_sim', 'mse', 'max_patch_match_sametarget', 'max_patch_match_alltargets'])
     parser.add_argument("--consistency_loss_lam", type=float, default=0.2,
                         help="weight for the fine network's semantic consistency loss")
     parser.add_argument("--consistency_loss_lam0", type=float, default=0.2,
@@ -1179,7 +1177,6 @@ def train():
                 rendered_embedding0 = rendered_embeddings[1]  # for coarse net
 
             # Randomly sample a target
-            assert len(args.consistency_loss_comparison) == 1 and args.consistency_loss_comparison[0] == 'cosine_sim', 'deprecated'
             if args.consistency_model_type.startswith('clip_vit'):
                 # Modified CLIP ViT to return sequence features. Extract the [CLS] token features
                 assert rendered_embedding.ndim == 2  # [L,D]
