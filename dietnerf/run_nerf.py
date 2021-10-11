@@ -795,8 +795,6 @@ def config_parser():
                         help='frequency of render_poses video saving')
     parser.add_argument("--save_splits", action="store_true",
                         help='save ground truth images and poses in each split')
-    parser.add_argument("--i_log_ctr_img", type=int, default=1,
-                        help='DEPRECATED. Unused argument.')
 
     ### options for learning with few views
     parser.add_argument("--max_train_views", type=int, default=-1,
@@ -821,14 +819,14 @@ def config_parser():
     parser.add_argument("--render_nW", "--consistency_nW", type=int, default=32, 
                         help='number of columns to render for consistency loss')
     parser.add_argument("--render_jitter_rays", "--consistency_jitter_rays", action='store_true')
-    # Computational options shared between rendering losses
+
+    # Computational options for rendering losses
     parser.add_argument("--checkpoint_rendering", action='store_true')
     parser.add_argument("--checkpoint_embedding", action='store_true')
     parser.add_argument("--no_mse", action='store_true')
     parser.add_argument("--pixel_interp_mode", type=str, default='bicubic')
     parser.add_argument("--feature_interp_mode", type=str, default='bilinear')
-
-    # Global semantic consistency loss
+    # Semantic consistency loss
     parser.add_argument("--consistency_loss", type=str, default='none', choices=['none', 'consistent_with_target_rep'])
     parser.add_argument("--consistency_loss_lam", type=float, default=0.2,
                         help="weight for the fine network's semantic consistency loss")
@@ -836,7 +834,7 @@ def config_parser():
                         help="weight for the coarse network's semantic consistency loss")
     parser.add_argument("--consistency_size", type=int, default=224)
     # Consistency model arguments
-    parser.add_argument("--consistency_model_type", type=str, default='clip_vit') # choices=['clip_vit', 'clip_rn50']
+    parser.add_argument("--consistency_model_type", type=str, default='clip_vit') # choices=['clip_vit', 'clip_vit_b16', 'clip_rn50']
     parser.add_argument("--consistency_model_num_layers", type=int, default=-1)
     parser.add_argument("--clip_cache_root", type=str, default=os.path.expanduser("~/.cache/clip"))
 
