@@ -32,7 +32,6 @@ Realistic Synthetic experiments are implemented in the `./dietnerf` subdirectory
 
 You need to download datasets
 from [NeRF's Google Drive folder](https://drive.google.com/drive/folders/128yBriW1IG_3NJ5Rp7APSTZsJqdJdfc1).
-Download `nerf_synthetic.zip` then unzip it in `src/DietNeRF/data/`.
 The dataset was used in the original NeRF paper by Mildenhall et al. For example,
 ```
 mkdir dietnerf/logs/ dietnerf/data/

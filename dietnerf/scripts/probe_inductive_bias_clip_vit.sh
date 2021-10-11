@@ -1,9 +1,0 @@
-mkdir logs/probe
-CUDA_VISIBLE_DEVICES=0 python probe_inductive_bias.py probe --datadir=./data/nerf_synthetic/drums --dataset_type=blender --half_res=True --testskip 8 --output_path ./logs/probe/emb_blender_paper_drums_clip_vit.pth --model_type clip_vit
-CUDA_VISIBLE_DEVICES=1 python probe_inductive_bias.py probe --datadir=./data/nerf_synthetic/ficus --dataset_type=blender --half_res=True --testskip 8 --output_path ./logs/probe/emb_blender_paper_ficus_clip_vit.pth --model_type clip_vit
-CUDA_VISIBLE_DEVICES=2 python probe_inductive_bias.py probe --datadir=./data/nerf_synthetic/hotdog --dataset_type=blender --half_res=True --testskip 8 --output_path ./logs/probe/emb_blender_paper_hotdog_clip_vit.pth --model_type clip_vit
-CUDA_VISIBLE_DEVICES=2 python probe_inductive_bias.py probe --datadir=./data/nerf_synthetic/chair --dataset_type=blender --half_res=True --testskip 8 --output_path ./logs/probe/emb_blender_paper_chair_clip_vit.pth --model_type clip_vit
-CUDA_VISIBLE_DEVICES=2 python probe_inductive_bias.py probe --datadir=./data/nerf_synthetic/materials --dataset_type=blender --half_res=True --testskip 8 --output_path ./logs/probe/emb_blender_paper_materials_clip_vit.pth --model_type clip_vit
-CUDA_VISIBLE_DEVICES=2 python probe_inductive_bias.py probe --datadir=./data/nerf_synthetic/mic --dataset_type=blender --half_res=True --testskip 8 --output_path ./logs/probe/emb_blender_paper_mic_clip_vit.pth --model_type clip_vit
-CUDA_VISIBLE_DEVICES=2 python probe_inductive_bias.py probe --datadir=./data/nerf_synthetic/ship --dataset_type=blender --half_res=True --testskip 8 --output_path ./logs/probe/emb_blender_paper_ship_clip_vit.pth --model_type clip_vit
-CUDA_VISIBLE_DEVICES=2 python probe_inductive_bias.py probe --datadir=./data/nerf_synthetic/lego --dataset_type=blender --half_res=True --testskip 8 --output_path ./logs/probe/emb_blender_paper_lego_clip_vit.pth --model_type clip_vit
