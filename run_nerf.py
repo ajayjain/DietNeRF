@@ -916,6 +916,10 @@ def train():
     wandb.run.save()
     wandb.config.update(args)
 
+    # Re-seed
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+
     # Multi-GPU
     args.n_gpus = torch.cuda.device_count()
     print(f"Using {args.n_gpus} GPU(s).")
@@ -1025,10 +1029,6 @@ def train():
         f = os.path.join(basedir, expname, 'config.txt')
         with open(f, 'w') as file:
             file.write(open(args.config, 'r').read())
-
-    # Re-seed
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
 
     # Create nerf model
     render_kwargs_train, render_kwargs_test, start, grad_vars, optimizer, scaler = create_nerf(args)
@@ -1592,7 +1592,6 @@ def train():
 
         if i%args.i_img==0:
             # Log a rendered validation view to Tensorboard
-            # img_i=np.random.choice(i_val)
             img_i=i_val[0]
             target = images[img_i]
             pose = poses[img_i, :3,:4].to(device)
