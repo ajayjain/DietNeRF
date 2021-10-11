@@ -12,6 +12,7 @@ to8b = lambda x : (255*np.clip(x,0,1)).astype(np.uint8)
 
 lpips_vgg = None
 
+
 @torch.no_grad()
 def get_perceptual_metrics(rgbs, gts, lpips_batch_size=8, device='cuda'):
     # rgbs and gts should be numpy arrays of the same shape
@@ -121,10 +122,6 @@ class NeRF(nn.Module):
         ### Implementation according to the official code release (https://github.com/bmild/nerf/blob/master/run_nerf_helpers.py#L104-L105)
         self.views_linears = nn.ModuleList([DenseLayer(input_ch_views + W, W//2, activation="relu")])
 
-        ### Implementation according to the paper
-        # self.views_linears = nn.ModuleList(
-        #     [nn.Linear(input_ch_views + W, W//2)] + [nn.Linear(W//2, W//2) for i in range(D//2)])
-        
         if use_viewdirs:
             self.feature_linear = DenseLayer(W, W, activation="linear")
             # TODO: use a softplus activation
@@ -207,15 +204,6 @@ def get_rays(H, W, focal, c2w, nH=None, nW=None, jitter=False):
     if nW is None:
         nW = W
 
-    # if jitter_continous:
-    #     # Perturb query points
-    #     dW = W / float(nW)
-    #     eps_W = np.random.uniform(high=dW)
-    #     w_pts = torch.linspace(int(eps_W), int(W-1-dW+eps_W), nW)
-
-    #     dH = H / float(nH)
-    #     eps_H = np.random.uniform(high=dH)
-    #     h_pts = torch.linspace(int(eps_H), int(H-1-dH+eps_H), nH)
     if jitter:
         # Perturb query points
         dW = W // nW 
