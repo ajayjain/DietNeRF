@@ -1,15 +1,11 @@
-import functools
 import json
 import os
 import time
-
-from numpy.lib.arraysetops import isin
 
 import clip_utils
 import configargparse
 import imageio
 import numpy as np
-import PIL
 from scipy.spatial.transform import Rotation
 import timm
 import torch
@@ -58,51 +54,6 @@ def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
     outputs_flat = batchify(fn, netchunk)(embedded)
     outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
     return outputs
-
-
-''' # This implementation chunks xyz and viewdir embedding as well as fn
-    # evaluation. However, it is more CPU intensive.
-def batchify(fn, chunk):
-    """Constructs a version of 'fn' that applies to smaller batches.
-    """
-    if chunk is None:
-        return fn
-    def ret(inputs, dirs=None):
-        if dirs is not None:
-            assert inputs.shape[0] == dirs.shape[0]
-        chunks = []
-        for i in range(0, inputs.shape[0], chunk):
-            input_chunk = inputs[i:i+chunk]
-            if dirs is not None:
-                dirs_chunk = dirs[i:i+chunk]
-            chunks.append(fn(input_chunk, dirs_chunk))
-        return torch.cat(chunks, 0)
-    return ret
-
-
-def run_network(inputs, viewdirs, fn, embed_fn, embeddirs_fn, netchunk=1024*64):
-    """Prepares inputs and applies network 'fn'.
-    """
-    inputs_flat = torch.reshape(inputs, [-1, inputs.shape[-1]])
-
-    if viewdirs is not None:
-        input_dirs = viewdirs.cpu()[:,None].expand(inputs.shape)
-        input_dirs_flat = torch.reshape(input_dirs, [-1, input_dirs.shape[-1]])
-
-    def embed_and_eval_chunk(inputs, dirs=None):
-        embedded = embed_fn(inputs.to(device))
-        assert 'cuda' in str(embedded.device)
-        if dirs is not None:
-            embedded_dirs = embeddirs_fn(dirs.to(device))
-            assert 'cuda' in str(embedded_dirs.device)
-            embedded = torch.cat([embedded, embedded_dirs], -1)
-        return fn(embedded)
-
-    outputs_flat = batchify(embed_and_eval_chunk, netchunk)(inputs_flat, input_dirs_flat)
-    assert 'cuda' in str(outputs_flat.device)
-    outputs = torch.reshape(outputs_flat, list(inputs.shape[:-1]) + [outputs_flat.shape[-1]])
-    return outputs
-'''
 
 
 def batchify_rays(rays_flat, chunk=1024*32, keep_keys=None, **kwargs):
@@ -218,12 +169,6 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
         if i==0:
             print(rgb.shape, disp.shape)
 
-        """
-        if gt_imgs is not None and render_factor==0:
-            p = -10. * np.log10(np.mean(np.square(rgb.cpu().numpy() - gt_imgs[i])))
-            print(p)
-        """
-
         if savedir is not None:
             rgb8 = to8b(rgbs[-1])
             filename = os.path.join(savedir, '{:03d}.png'.format(i))
@@ -237,8 +182,7 @@ def render_path(render_poses, hwf, chunk, render_kwargs, gt_imgs=None, savedir=N
 
 
 def create_nerf(args):
-    """Instantiate NeRF's MLP model.
-    """
+    """Instantiate NeRF's MLP model."""
     embed_fn, input_ch = get_embedder(args.multires, args.i_embed)
 
     input_ch_views = 0
@@ -578,73 +522,6 @@ def get_embed_fn(model_type, num_layers=-1, spatial=False, checkpoint=False, cli
     return embed
 
 
-def c2w_to_w2c(c2w):
-    assert c2w.shape == (3, 4)
-    c2w_rotation = c2w[:, :3]
-    camera_origin = c2w[:, 3].unsqueeze(1)
-    return torch.cat([c2w_rotation.T, -c2w_rotation.T.mm(camera_origin)], dim=1)
-
-
-def world_to_image(rendered_pts, w2c, H, W, focal, principal_point):
-    """Convert from ray pts in world coordinates to image coordinates
-
-    Args:
-        rendered_pts (tensor): [cnH,cnW,sampled_pts,3] xyz world coordinates along rays
-        w2c (tensor): [3,4] transformation matrix to camera pose
-    Returns:
-        uv (tensor): [cnH,cnW,sampled_pts,2] uv pixel coordinates between 0 and H or W
-        norm_uv (tensor): [cnH,cnW,sampled_pts,2] normalized uv pixel coordinates between -1 and 1
-    """
-    # Transform rendered rays
-    rendered_pts_extended = torch.cat([rendered_pts, torch.ones_like(rendered_pts[..., 0:1])], dim=-1)
-    rendered_pts_camera = torch.einsum('cw,absw->absc', w2c, rendered_pts_extended)
-
-    # Convert to image coordinates
-    uv = -rendered_pts_camera[..., :2] / rendered_pts_camera[..., 2:]  # [H,W,B,2]
-    uv = uv * focal + principal_point
-    uv[..., 1] = H - uv[..., 1]
-    norm_uv = uv / torch.tensor([H,W], device=uv.device) * 2 - 1  # between [-1, 1] for F.grid_sample
-
-    return uv, norm_uv
-
-
-def resample_features(features, norm_uv, weights, feature_interp_mode='bilinear'):
-    """
-    Args:
-        features (tensor): [D, H, W] or [1, D, H, W]
-        norm_uv (tensor): [cnH, cnW, samples_per_ray, 2]
-        weights (tensor): [cnH, cnW, samples_per_ray]
-        feature_interp_mode (str): bilinear or nearest
-    Returns:
-        features (tensor): [1, D, cnH, cnW]
-    """
-    # Resample features along rays
-    features = features.expand(norm_uv.shape[2], -1, -1, -1)  # [samples_per_ray, D, H, W]
-    features = F.grid_sample(
-        features,
-        norm_uv.permute(2, 0, 1, 3).type(features.dtype),  # [samples_per_ray, consistency_nH, consistency_nW, 2]
-        align_corners=True,
-        padding_mode='border',
-        mode=feature_interp_mode,
-    )  # [samples_per_ray, D, consistency_nH, consistency_nW], D is 256 for CLIP RN50 featurize
-
-    # Weighted average of target features along each ray
-    weights = weights.permute(2, 0, 1).unsqueeze(1)
-    features = weights * features
-    features = features.sum(dim=0, keepdim=True)  # [1, D, cnH, cnW]
-
-    return features
-
-
-def get_patch_similarity_matrix(embs1, embs2):
-    assert embs1.ndim == 2  # [L1,D]
-    assert embs2.ndim == 3  # [L2,D]
-    embs1 = F.normalize(embs1, p=2, dim=-1)  # [L1,D]
-    embs2 = F.normalize(embs2, p=2, dim=-1)  # [B,L2,D]
-    sim = torch.matmul(embs2, embs1.transpose(0,1))  # [B,L2,L1]
-    return sim.view(-1, embs1.shape[0]).transpose(0,1)  # [L1,B*L2]
-
-
 @torch.no_grad()
 def make_wandb_image(tensor, preprocess='scale'):
     tensor = tensor.detach()
@@ -660,15 +537,6 @@ def make_wandb_image(tensor, preprocess='scale'):
 @torch.no_grad()
 def make_wandb_histogram(tensor):
     return wandb.Histogram(tensor.detach().flatten().cpu().numpy())
-
-
-@torch.no_grad()
-def log_discriminator_histograms(metrics, key, preds):
-    if isinstance(preds, list):
-        for disc_id, pred in enumerate(preds):
-            metrics[f'{key}_D{disc_id}'] = make_wandb_histogram(pred)
-    else:
-        metrics[f'{key}_D0'] = make_wandb_histogram(preds)
 
 
 def config_parser():
