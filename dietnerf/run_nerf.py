@@ -578,25 +578,6 @@ def get_embed_fn(model_type, num_layers=-1, spatial=False, checkpoint=False, cli
     return embed
 
 
-def compute_aligned_loss(args, features1, features2, acc_map=None):
-    assert features1.ndim == 4
-    assert features1.shape == features2.shape
-
-    if args.aligned_loss_comparison == 'mse':
-        mse = F.mse_loss(features1, features2, reduction='none')
-        if args.mask_aligned_loss:
-            assert acc_map.shape == features1.shape[2:]  # [H,W]
-            mse = mse * acc_map.unsqueeze(0).unsqueeze(1)
-        return mse.mean()
-
-    if args.aligned_loss_comparison == 'cosine_sim':
-        sim = F.cosine_similarity(features1, features2, dim=1)
-        if args.mask_aligned_loss:
-            assert acc_map.shape == features1.shape[2:]  # [H,W]
-            sim = sim * acc_map.unsqueeze(0)
-        return -sim.mean()
-
-
 def c2w_to_w2c(c2w):
     assert c2w.shape == (3, 4)
     c2w_rotation = c2w[:, :3]
@@ -860,24 +841,11 @@ def config_parser():
                         help="weight for the fine network's semantic consistency loss")
     parser.add_argument("--consistency_loss_lam0", type=float, default=0.2,
                         help="weight for the coarse network's semantic consistency loss")
-    parser.add_argument("--consistency_target_augmentation", type=str, default='none', choices=[
-        'none', 'flips', 'tencrop'])
     parser.add_argument("--consistency_size", type=int, default=224)
     # Consistency model arguments
     parser.add_argument("--consistency_model_type", type=str, default='clip_vit') # choices=['clip_vit', 'clip_rn50']
     parser.add_argument("--consistency_model_num_layers", type=int, default=-1)
     parser.add_argument("--clip_cache_root", type=str, default=os.path.expanduser("~/.cache/clip"))
-
-    # Aligned feature consistency arguments
-    parser.add_argument("--aligned_loss", action='store_true')
-    parser.add_argument("--mask_aligned_loss", action='store_true')
-    parser.add_argument("--spatial_model_type", type=str, default='clip_rn50', choices=['clip_vit', 'clip_rn50'])
-    parser.add_argument("--spatial_model_num_layers", type=int, default=-1)
-    parser.add_argument("--aligned_loss_comparison", type=str, default='cosine_sim', choices=['cosine_sim', 'mse'])
-    parser.add_argument("--aligned_loss_lam", type=float, default=0.1,
-                        help="weight for the fine network's aligned semantic consistency loss")
-    parser.add_argument("--aligned_loss_lam0", type=float, default=0.1,
-                        help="weight for the coarse network's aligned semantic consistency loss")
 
     return parser
 
@@ -976,11 +944,6 @@ def train():
     if args.consistency_loss != 'none':
         print(f'Using auxilliary consistency loss [{args.consistency_loss}], fine weight [{args.consistency_loss_lam}], coarse weight [{args.consistency_loss_lam0}]')
         embed = get_embed_fn(args.consistency_model_type, args.consistency_model_num_layers, checkpoint=args.checkpoint_embedding, clip_cache_root=args.clip_cache_root)
-    if args.aligned_loss:
-        embed_spatial = get_embed_fn(
-            args.spatial_model_type, args.spatial_model_num_layers, spatial=True,
-            checkpoint=args.checkpoint_embedding,
-            clip_cache_root=args.clip_cache_root)
 
     # Cast intrinsics to right types
     H, W, focal = hwf
@@ -1100,26 +1063,9 @@ def train():
             rays_rgb_d.append(rays_d)
         N_rand_per_view = N_rand // len(i_train)
 
-        # For random ray batching
-        # rays = np.stack([get_rays_np(H, W, focal, p) for p in poses[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
-        # print('done, concats')
-        # rays_rgb = np.concatenate([rays, images[:,None]], 1) # [N, ro+rd+rgb, H, W, 3]
-        # rays_rgb = np.transpose(rays_rgb, [0,2,3,1,4]) # [N, H, W, ro+rd+rgb, 3]
-        # rays_rgb = np.stack([rays_rgb[i] for i in i_train], 0) # train images only
-        # rays_rgb = np.reshape(rays_rgb, [-1,3,3]) # [(N-1)*H*W, ro+rd+rgb, 3]
-        # rays_rgb = rays_rgb.astype(np.float32)
-        # print('shuffle rays')
-        # np.random.shuffle(rays_rgb)
-
-        # print('done')
-        # i_batch = 0
-
     # Move training data to GPU
     images = torch.Tensor(images).to(device)
     poses = torch.Tensor(poses).to(device)
-    # if use_batching:
-    #     rays_rgb = torch.Tensor(rays_rgb).to(device)
-
 
     N_iters = args.N_iters + 1
     print('Begin')
@@ -1128,7 +1074,7 @@ def train():
     print('VAL views are', i_val)
 
     calc_ctr_loss = args.consistency_loss.startswith('consistent_with_target_rep')
-    any_rendered_loss = (calc_ctr_loss or args.aligned_loss)
+    any_rendered_loss = calc_ctr_loss
     if any_rendered_loss:
         with torch.no_grad():
             targets = images[i_train].permute(0, 3, 1, 2).to(device)
@@ -1137,29 +1083,11 @@ def train():
     # Embed training images for consistency loss
     if calc_ctr_loss:
         with torch.no_grad():
-            i_train_map = {it: i for i, it in enumerate(i_train)}  # map from indices into all images to indices in selected training images
-            if args.consistency_target_augmentation != 'none':
-                raise NotImplementedError
             targets_resize_model = F.interpolate(targets, (args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
             target_embeddings = embed(targets_resize_model)  # [N,L,D]
 
     # Embed training images for aligned consistency loss
     consistency_keep_keys = ['rgb_map', 'rgb0']
-    if args.aligned_loss:
-        assert calc_ctr_loss
-        assert args.dataset_type != 'llff' or args.no_ndc  # Haven't written working transform code for NDC
-        assert not args.render_jitter_rays  # Translating the rays leads to a mismatched alignment
-
-        with torch.no_grad():
-            # Embed targets
-            target_features = embed_spatial(targets_resize_model)  # [N,C,fH,fW]
-
-            # Resize target features at the full resolution (H,W)
-            targets_features_resize_full = F.interpolate(target_features, (H, W), mode=args.feature_interp_mode)
-
-            principal_point = torch.tensor([[H/2., W/2.]], device=device)
-
-        consistency_keep_keys = ['rgb_map', 'rgb0', 'pts', 'pts0', 'weights', 'weights0', 'acc_map', 'acc0']
  
     start = start + 1
     for i in trange(start, N_iters):
@@ -1177,21 +1105,6 @@ def train():
                 target_s.append(target_s_pose)
             batch_rays = torch.cat(batch_rays, dim=1).to(device)  # (2, N_rand, 3)
             target_s = torch.cat(target_s, dim=0).to(device)  # (N_rand, 3)
-
-            # Random over all images
-            # NOTE: this seems to lead to zero gradients for the fine network
-            # for NeRF's blender realistic synthetic scenes. Should use this
-            # for forward facing llff data, however.
-            # batch = rays_rgb[i_batch:i_batch+N_rand] # [B, 2+1, 3*?]
-            # batch = torch.Tensor(batch).to(device)
-            # batch = torch.transpose(batch, 0, 1)
-            # batch_rays, target_s = batch[:2], batch[2]
-
-            # i_batch += N_rand
-            # if i_batch >= rays_rgb.shape[0]:
-            #     print("Shuffle data after an epoch!")
-            #     np.random.shuffle(rays_rgb)
-            #     i_batch = 0
         else:
             assert N_rand is not None
 
@@ -1256,53 +1169,10 @@ def train():
             if i == 0:
                 print('rendering losses rendered rgb image shape:', rgbs.shape)
 
-            if args.aligned_loss:
-                # TODO: support sampling nearby targets
-                assert args.no_batching, 'can only warp to one target pose'
-                align_target_i = img_i
-                align_target_pose = poses[align_target_i, :3,:4].to(device)
-
-                # Create world to target camera trasformation
-                w2c = c2w_to_w2c(align_target_pose)
-
-                # Transform rendered rays
-                _, norm_uv = run_checkpoint(world_to_image, extras['pts'], w2c, H, W, focal, principal_point)
-                _, norm_uv0 = run_checkpoint(world_to_image, extras['pts0'], w2c, H, W, focal, principal_point)
-
-                # Embed rendered images into spatial features
-                rgbs_resize_c = F.interpolate(rgbs, size=(args.consistency_size, args.consistency_size), mode=args.pixel_interp_mode)
-                rendered_features = embed_spatial(rgbs_resize_c)  # [2, D, fH, fW] = [2, 256, 56, 56] for CLIP RN50
-                
-                _resample = functools.partial(resample_features, feature_interp_mode=args.feature_interp_mode)
-                target_feature_samples = run_checkpoint(_resample,
-                    targets_features_resize_full[i_train_map[align_target_i]],
-                    norm_uv,
-                    extras['weights'],
-                )
-
-                target_feature_samples0 = run_checkpoint(_resample,
-                    targets_features_resize_full[i_train_map[align_target_i]],
-                    norm_uv0,
-                    extras['weights0'],
-                )
-
-                # Save acc map for loss calculation
-                rendered_acc_map = extras['acc_map']
-                rendered_acc0 = extras['acc0']
-
             # Log rendered images
             metrics['train_ctr/rgb'] = make_wandb_image(extras['rgb_map'], 'clip')
             if args.N_importance > 0:
                 metrics['train_ctr/rgb0'] = make_wandb_image(extras['rgb0'], 'clip')
-
-            # Log rendered features and warped target features
-            if args.aligned_loss:
-                metrics['train_aligned/target_feature'] = make_wandb_image(targets_features_resize_full[i_train_map[align_target_i]][...,None].mean(0))
-                metrics['train_aligned/target_feature_samples'] = make_wandb_image(target_feature_samples[0,...,None].mean(0))
-                metrics['train_aligned/rendered_features'] = make_wandb_image(rendered_features[0,...,None].mean(0))
-                metrics['train_aligned/rendered_features0'] = make_wandb_image(rendered_features[1,...,None].mean(0))
-                metrics['train_aligned/acc_map'] = make_wandb_image(rendered_acc_map.unsqueeze(-1))
-                metrics['train_aligned/acc0'] = make_wandb_image(rendered_acc0.unsqueeze(-1))
 
         #####  Core optimization loop  #####
 
@@ -1317,7 +1187,6 @@ def train():
             rendered_embeddings = embed(rgbs_resize_c)
             rendered_embedding = rendered_embeddings[0]
             if args.N_importance > 0:
-                # NOTE(3/14/21): Fixed a bug that wasn't updating the coarse network with the consistency loss
                 rendered_embedding0 = rendered_embeddings[1]  # for coarse net
 
             # Randomly sample a target
@@ -1368,23 +1237,6 @@ def train():
             loss = loss + consistency_loss * args.consistency_loss_lam
             if args.N_importance > 0:
                 loss = loss + consistency_loss0 * args.consistency_loss_lam0
-
-        if args.aligned_loss and render_loss_iter:
-            rendered_features_resize_c = F.interpolate(rendered_features, (args.render_nH, args.render_nW), mode=args.feature_interp_mode)
-            rendered_features_resize_c = rendered_features_resize_c.float()
-
-            aligned_loss = compute_aligned_loss(args,
-                rendered_features_resize_c[0:1],
-                target_feature_samples,  # [1, D, cnH, cnW]
-                rendered_acc_map)
-
-            aligned_loss0 = compute_aligned_loss(args,
-                rendered_features_resize_c[1:2],
-                target_feature_samples0,
-                rendered_acc0)
-
-            loss = (loss + aligned_loss * args.aligned_loss_lam +
-                    aligned_loss0 * args.aligned_loss_lam0)
 
         if not args.no_mse:
             # Standard NeRF MSE loss with subsampled rays
@@ -1469,10 +1321,6 @@ def train():
                     metrics["train_ctr/consistency_loss"] = consistency_loss.item()
                     if args.N_importance > 0:
                         metrics["train_ctr/consistency_loss0"] = consistency_loss0.item()
-                if args.aligned_loss:
-                    metrics["train_aligned/aligned_loss"] = aligned_loss.item()
-                    if args.N_importance > 0:
-                        metrics["train_aligned/aligned_loss0"] = aligned_loss0.item()
 
         if i%args.i_log_raw_hist==0:
             metrics["train/tran"] = wandb.Histogram(trans.detach().cpu().numpy())
