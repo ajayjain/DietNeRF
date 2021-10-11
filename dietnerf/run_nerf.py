@@ -832,9 +832,6 @@ def config_parser():
     parser.add_argument("--consistency_loss", type=str, default='none', choices=['none', 'consistent_with_target_rep'])
     parser.add_argument("--consistency_loss_comparison", type=str, default=['cosine_sim'], nargs='+', choices=[
         'cosine_sim', 'mse', 'max_patch_match_sametarget', 'max_patch_match_alltargets'])
-    parser.add_argument("--consistency_loss_sampling", type=str, default='single_random', choices=[
-        'single_random', 'distance_weighted'])
-    parser.add_argument("--consistency_loss_sampling_temp", type=float, default=1.)
     parser.add_argument("--consistency_loss_lam", type=float, default=0.2,
                         help="weight for the fine network's semantic consistency loss")
     parser.add_argument("--consistency_loss_lam0", type=float, default=0.2,
@@ -1198,33 +1195,12 @@ def train():
                 if args.N_importance > 0:
                     rendered_emb0 = rendered_embedding0
 
-            if args.consistency_loss_sampling == 'single_random':
-                target_i = np.random.randint(target_emb.shape[0])
-                target_emb = target_emb[target_i]
-                consistency_loss = -torch.cosine_similarity(target_emb, rendered_emb, dim=-1)
-                if args.N_importance > 0:
-                    consistency_loss0 = -torch.cosine_similarity(target_emb, rendered_emb0, dim=-1)
-            elif args.consistency_loss_sampling == 'distance_weighted':
-                with torch.no_grad():
-                    target_xyz_origin = poses[i_train][:, :3, -1]  # [N, 3]
-                    rendered_xyz_origin = pose[:3, -1].unsqueeze(0)  # [1, 3]
-                    diffs = target_xyz_origin - rendered_xyz_origin
-                    target_distances = torch.sqrt((diffs ** 2).sum(dim=-1))  # [N]
-                    target_weights = F.softmax(-target_distances / args.consistency_loss_sampling_temp)  # [N]
-
-                    metrics['train_ctr/target_weighted_distance'] = torch.sum(target_weights * target_distances).item()
-                    metrics['train_ctr/target_mean_distance'] = torch.mean(target_distances).item()
-                    metrics['train_ctr/target_distances'] = make_wandb_histogram(target_distances)
-                    metrics['train_ctr/target_weights'] = make_wandb_histogram(target_weights)
-
-                consistency_loss = -torch.cosine_similarity(target_emb, rendered_emb.unsqueeze(0), dim=-1)  # [N]
-                metrics['train_ctr/consistency_loss_alltargets'] = make_wandb_histogram(consistency_loss)
-                consistency_loss = torch.sum(target_weights * consistency_loss)
-
-                if args.N_importance > 0:
-                    consistency_loss0 = -torch.cosine_similarity(target_emb, rendered_emb0.unsqueeze(0), dim=-1)
-                    metrics['train_ctr/consistency_loss0_alltargets'] = make_wandb_histogram(consistency_loss0)
-                    consistency_loss0 = torch.sum(target_weights * consistency_loss0)
+            # Sample a single random target for consistency loss
+            target_i = np.random.randint(target_emb.shape[0])
+            target_emb = target_emb[target_i]
+            consistency_loss = -torch.cosine_similarity(target_emb, rendered_emb, dim=-1)
+            if args.N_importance > 0:
+                consistency_loss0 = -torch.cosine_similarity(target_emb, rendered_emb0, dim=-1)
 
             loss = loss + consistency_loss * args.consistency_loss_lam
             if args.N_importance > 0:
