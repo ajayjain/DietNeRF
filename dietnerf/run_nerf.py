@@ -805,8 +805,6 @@ def config_parser():
     # Options for rendering shared between different losses
     parser.add_argument("--render_loss_interval", "--consistency_loss_interval",
         type=float, default=1)
-    parser.add_argument("--render_increase_interval_every", type=int, default=0)
-    parser.add_argument("--render_increase_interval_delta", type=int, default=0)
     parser.add_argument("--render_autocast", action='store_true')
     parser.add_argument("--render_poses", "--consistency_poses",
         type=str, choices=['loaded', 'interpolate_train_all', 'uniform'], default='loaded')
@@ -1078,7 +1076,6 @@ def train():
     if any_rendered_loss:
         with torch.no_grad():
             targets = images[i_train].permute(0, 3, 1, 2).to(device)
-    render_loss_interval = args.render_loss_interval
 
     # Embed training images for consistency loss
     if calc_ctr_loss:
@@ -1121,12 +1118,7 @@ def train():
             target_s = target_s.to(device)
 
         # Representational consistency loss with rendered image
-        render_loss_iter = i % render_loss_interval == 0
-        if any_rendered_loss:
-            metrics['train_ctr/render_loss_interval'] = render_loss_interval
-            if args.render_increase_interval_every > 0 and i%args.render_increase_interval_every == 0:
-                # Reduce frequency of rendering losses
-                render_loss_interval += args.render_increase_interval_delta
+        render_loss_iter = i % args.render_loss_interval == 0
 
         if any_rendered_loss and render_loss_iter:
             with torch.no_grad():
