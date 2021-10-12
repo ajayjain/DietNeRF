@@ -1,25 +1,25 @@
 #!/bin/bash
 
 ## Train
-CUDA_VISIBLE_DEVICES=0 python run_nerf.py --config configs/330_blender_chair_8views_simple.txt &
-CUDA_VISIBLE_DEVICES=1 python run_nerf.py --config configs/331_blender_drums_8views_simple.txt &
-CUDA_VISIBLE_DEVICES=2 python run_nerf.py --config configs/332_blender_ficus_8views_simple.txt &
-CUDA_VISIBLE_DEVICES=3 python run_nerf.py --config configs/334_blender_mic_8views_simple.txt &
-CUDA_VISIBLE_DEVICES=4 python run_nerf.py --config configs/335_blender_ship_8views_simple.txt &
-CUDA_VISIBLE_DEVICES=5 python run_nerf.py --config configs/312_blender_lego_8views_tune.txt &
-CUDA_VISIBLE_DEVICES=6 python run_nerf.py --config configs/345_blender_hotdog_8views_simplest.txt &
-CUDA_VISIBLE_DEVICES=7 python run_nerf.py --config configs/347_blender_materials_8views_simpler.txt &
+CUDA_VISIBLE_DEVICES=0 python run_nerf.py --config configs/simplified_nerf_8v/330_blender_chair_8views_simple.txt &
+CUDA_VISIBLE_DEVICES=1 python run_nerf.py --config configs/simplified_nerf_8v/331_blender_drums_8views_simple.txt &
+CUDA_VISIBLE_DEVICES=2 python run_nerf.py --config configs/simplified_nerf_8v/332_blender_ficus_8views_simple.txt &
+CUDA_VISIBLE_DEVICES=3 python run_nerf.py --config configs/simplified_nerf_8v/334_blender_mic_8views_simple.txt &
+CUDA_VISIBLE_DEVICES=4 python run_nerf.py --config configs/simplified_nerf_8v/335_blender_ship_8views_simple.txt &
+CUDA_VISIBLE_DEVICES=5 python run_nerf.py --config configs/simplified_nerf_8v/312_blender_lego_8views_tune.txt &
+CUDA_VISIBLE_DEVICES=6 python run_nerf.py --config configs/simplified_nerf_8v/345_blender_hotdog_8views_simplest.txt &
+CUDA_VISIBLE_DEVICES=7 python run_nerf.py --config configs/simplified_nerf_8v/347_blender_materials_8views_simpler.txt &
 wait;
 
 ## Test
-CUDA_VISIBLE_DEVICES=0 python run_nerf.py --render_only --render_test --config configs/345_blender_hotdog_8views_simplest.txt &
-CUDA_VISIBLE_DEVICES=1 python run_nerf.py --render_only --render_test --config configs/347_blender_materials_8views_simpler.txt &
-CUDA_VISIBLE_DEVICES=2 python run_nerf.py --render_only --render_test --config configs/335_blender_ship_8views_simple.txt &
-CUDA_VISIBLE_DEVICES=3 python run_nerf.py --render_only --render_test --config configs/331_blender_drums_8views_simple.txt &
-CUDA_VISIBLE_DEVICES=4 python run_nerf.py --render_only --render_test --config configs/330_blender_chair_8views_simple.txt &
-CUDA_VISIBLE_DEVICES=5 python run_nerf.py --render_only --render_test --config configs/334_blender_mic_8views_simple.txt &
-CUDA_VISIBLE_DEVICES=6 python run_nerf.py --render_only --render_test --config configs/332_blender_ficus_8views_simple.txt &
-CUDA_VISIBLE_DEVICES=7 python run_nerf.py --render_only --render_test --config configs/312_blender_lego_8views_tune.txt &
+CUDA_VISIBLE_DEVICES=0 python run_nerf.py --render_only --render_test --config configs/simplified_nerf_8v/345_blender_hotdog_8views_simplest.txt &
+CUDA_VISIBLE_DEVICES=1 python run_nerf.py --render_only --render_test --config configs/simplified_nerf_8v/347_blender_materials_8views_simpler.txt &
+CUDA_VISIBLE_DEVICES=2 python run_nerf.py --render_only --render_test --config configs/simplified_nerf_8v/335_blender_ship_8views_simple.txt &
+CUDA_VISIBLE_DEVICES=3 python run_nerf.py --render_only --render_test --config configs/simplified_nerf_8v/331_blender_drums_8views_simple.txt &
+CUDA_VISIBLE_DEVICES=4 python run_nerf.py --render_only --render_test --config configs/simplified_nerf_8v/330_blender_chair_8views_simple.txt &
+CUDA_VISIBLE_DEVICES=5 python run_nerf.py --render_only --render_test --config configs/simplified_nerf_8v/334_blender_mic_8views_simple.txt &
+CUDA_VISIBLE_DEVICES=6 python run_nerf.py --render_only --render_test --config configs/simplified_nerf_8v/332_blender_ficus_8views_simple.txt &
+CUDA_VISIBLE_DEVICES=7 python run_nerf.py --render_only --render_test --config configs/simplified_nerf_8v/312_blender_lego_8views_tune.txt &
 
 ## FID and KID
 mkdir logs/nerf_simple_images_8
