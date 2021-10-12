@@ -1,5 +1,5 @@
-expname = 252_blender_ficus_8views_ctr
-datadir = ./data/nerf_synthetic/ficus
+expname = 257_blender_materials_8views_ctr
+datadir = ./data/nerf_synthetic/materials
 basedir = ./logs
 dataset_type = blender
 no_batching = True

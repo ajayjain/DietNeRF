@@ -52,7 +52,7 @@ Each experiment has a config file stored in `dietnerf/configs/`. Scripts in `die
 Run these scripts from `./dietnerf`.
 The scripts assume you are running one script at a time on a server with 8 NVIDIA GPUs.
 ```
-cd src/DietNeRF
+cd dietnerf
 export WANDB_ENTITY=<your wandb username>
 
 # NeRF baselines

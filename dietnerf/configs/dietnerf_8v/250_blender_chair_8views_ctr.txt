@@ -12,7 +12,6 @@ N_rand = 1024
 precrop_iters = 500
 precrop_frac = 0.5
 half_res = True
-seed = 123
 
 ## Additional arguments
 max_train_views = 8
@@ -41,4 +40,3 @@ consistency_loss_lam = 0.1
 consistency_loss_lam0 = 0.1
 consistency_model_type = clip_vit
 consistency_size = 224
-consistency_loss_comparison = cosine_sim
