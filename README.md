@@ -1,23 +1,24 @@
-# DietNeRF: Semantically consistent radiance fields for few shot view synthesis
+# Putting NeRF on a Diet: Semantically Consistent Few-Shot View Synthesis
+[Website](https://ajayj.com/dietnerf)  |  [ICCV paper](https://openaccess.thecvf.com/content/ICCV2021/html/Jain_Putting_NeRF_on_a_Diet_Semantically_Consistent_Few-Shot_View_Synthesis_ICCV_2021_paper.html)  |  [arXiv](https://arxiv.org/abs/2104.00677)  | [Twitter](https://twitter.com/ajayj_/status/1379475290154356738)
+
+This repository contains the official implementation of DietNeRF, a system that reconstructs 3D scenes from a few posed photos.
 
 ## Setup
 
-We will use the following folder structure:
+We use the following folder structure:
 ```
 dietnerf/
   logs/ (images, videos, checkpoints)
   data/
     nerf_synthetic/
-    nerf_llff_data/
   configs/ (run configuration files)
 CLIP/ (Fork of OpenAI's clip repository with a wrapper)
 ```
 
-Create conda environment and login to wandb:
+Create conda environment:
 ```
 conda create -n dietnerf python=3.9
 conda activate dietnerf
-wandb login
 ```
 
 Set up requirements and our fork of CLIP:
@@ -25,6 +26,11 @@ Set up requirements and our fork of CLIP:
 pip install -r requirements.txt
 cd CLIP
 pip install -e .
+```
+
+Login to Weights & Biases:
+```
+wandb login
 ```
 
 ## Experiments on the Realistic Synthetic dataset
@@ -69,16 +75,19 @@ sh scripts/run_synthetic_unseen_side_14v.sh
 ```
 
 ## Experiments on the DTU dataset
-Coming soon
+Coming soon. Our paper also fine-tunes pixelNeRF on DTU scenes for 1-shot view synthesis.
 
 ## Citation and acknowledgements
-If DietNeRF is relevant to your project, please cite our associated paper:
+If DietNeRF is relevant to your project, please cite our associated [paper](https://openaccess.thecvf.com/content/ICCV2021/html/Jain_Putting_NeRF_on_a_Diet_Semantically_Consistent_Few-Shot_View_Synthesis_ICCV_2021_paper.html):
 ```
-@article{jain2021dietnerf,
-      title={Putting NeRF on a Diet: Semantically Consistent Few-Shot View Synthesis},
-      author={Ajay Jain and Matthew Tancik and Pieter Abbeel},
-      year={2021},
-      journal={arXiv},
+@InProceedings{Jain_2021_ICCV,
+    author    = {Jain, Ajay and Tancik, Matthew and Abbeel, Pieter},
+    title     = {Putting NeRF on a Diet: Semantically Consistent Few-Shot View Synthesis},
+    booktitle = {Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)},
+    month     = {October},
+    year      = {2021},
+    pages     = {5885-5894}
 }
 ```
 This code is based on Yen-Chen Lin's [PyTorch implementation of NeRF](https://github.com/yenchenlin/nerf-pytorch) and the [official pixelNeRF code](https://github.com/sxyu/pixel-nerf).
+
