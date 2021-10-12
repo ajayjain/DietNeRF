@@ -1,4 +1,4 @@
-expname = 288_blender_hotdog_8views_ftctr256_200k
+expname = 288_blender_hotdog_8views_ftctr256
 datadir = ./data/nerf_synthetic/hotdog
 basedir = ./logs
 dataset_type = blender
@@ -29,5 +29,5 @@ no_batching = True
 
 render_jitter_rays = False
 half_res = True
-ft_path = ./logs/256_blender_hotdog_8views_ctr_resume150k/200000.tar
+ft_path = ./logs/256_blender_hotdog_8views_ctr/200000.tar
 N_iters = 400000

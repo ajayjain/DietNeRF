@@ -1,4 +1,4 @@
-expname = 286_blender_lego_8views_ftctr042
+expname = 286_blender_lego_8views_ftctr253
 datadir = ./data/nerf_synthetic/lego
 basedir = ./logs
 dataset_type = blender
@@ -29,5 +29,5 @@ no_batching = True
 
 render_jitter_rays = False
 half_res = True
-ft_path = ./logs/042_blender_paper_lego_ctr_coarseandfine_clip_vit_reuseemb_uniformpose/200000.tar
+ft_path = ./logs/253_blender_lego_8views_ctr/200000.tar
 N_iters = 400000
