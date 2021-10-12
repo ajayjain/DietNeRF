@@ -1,4 +1,3 @@
-# Originally named 317_blender_lego_8views_right_tune
 expname = 317_blender_lego_right_nerf_simple
 datadir = ./data/nerf_synthetic/lego
 basedir = ./logs

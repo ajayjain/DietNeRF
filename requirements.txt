@@ -15,3 +15,4 @@ fire
 lpips
 scikit-image>=0.12.0,<0.18
 gdown
+ray

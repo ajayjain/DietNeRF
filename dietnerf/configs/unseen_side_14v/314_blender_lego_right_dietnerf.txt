@@ -1,4 +1,3 @@
-# Originally named 314_blender_lego_8views_ctr_right
 expname = 314_blender_lego_right_dietnerf
 datadir = ./data/nerf_synthetic/lego
 basedir = ./logs
@@ -40,7 +39,6 @@ consistency_loss_lam = 0.1
 consistency_loss_lam0 = 0.1
 consistency_model_type = clip_vit
 consistency_size = 224
-consistency_loss_comparison = cosine_sim
 
 ## views
 hardcode_train_views = [2, 5, 8, 9, 10, 16, 34, 35, 40, 52, 53, 54, 58, 60]

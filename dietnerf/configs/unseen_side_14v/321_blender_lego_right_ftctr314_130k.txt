@@ -1,4 +1,3 @@
-# Originally named 321_blender_lego_8views_right_ftctr314_130k
 expname = 321_blender_lego_right_ftctr314_130k
 datadir = ./data/nerf_synthetic/lego
 basedir = ./logs
