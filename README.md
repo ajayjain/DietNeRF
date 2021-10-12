@@ -1,6 +1,8 @@
 # Putting NeRF on a Diet: Semantically Consistent Few-Shot View Synthesis
 [Website](https://ajayj.com/dietnerf)  |  [ICCV paper](https://openaccess.thecvf.com/content/ICCV2021/html/Jain_Putting_NeRF_on_a_Diet_Semantically_Consistent_Few-Shot_View_Synthesis_ICCV_2021_paper.html)  |  [arXiv](https://arxiv.org/abs/2104.00677)  | [Twitter](https://twitter.com/ajayj_/status/1379475290154356738)
 
+![Diagram overviewing DietNeRF's training procedure](https://d33wubrfki0l68.cloudfront.net/360965d431284b958d86082f9b49d53a0356b632/85d1a/dietnerf/assets/img/dietnerf_method_anim_50p.gif)
+
 This repository contains the official implementation of DietNeRF, a system that reconstructs 3D scenes from a few posed photos.
 
 ## Setup
